@@ -1,0 +1,43 @@
+/* hyprdeb managed: this file is overwritten by install.sh (a differing existing file is backed up once). */
+* {
+    font-family: "Noto Sans Mono", "tabler-icons", sans-serif;   /* "tabler-icons" before sans-serif: Material Icons shares its private-use codepoints */
+    font-size: 13px;
+}
+
+window#waybar {
+    background-color: rgba(30, 32, 40, 0.85);
+    color: #e6e6e6;
+}
+
+#workspaces button {
+    padding: 0 8px;
+    background: transparent;
+    color: #9aa0b0;
+    border: none;
+    border-radius: 0;
+}
+
+#workspaces button.active {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+#workspaces button.urgent {
+    background: #c0392b;
+}
+
+#clock, #custom-vpn, #custom-dnd, #language, #pulseaudio, #network, #cpu, #memory, #tray, #window {
+    padding: 0 8px;
+}
+
+#network.disconnected, #pulseaudio.muted {
+    color: #e0a458;
+}
+
+#custom-dnd.dnd {
+    color: #e0a458;
+}
+
+#custom-vpn.vpn {
+    color: #7dcfa0;
+}

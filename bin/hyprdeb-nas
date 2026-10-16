@@ -1,0 +1,672 @@
+#!/usr/bin/python3 -I
+# hyprdeb managed: root helper for NAS shares (CIFS through a systemd mount + automount). Installed to /usr/local/sbin by
+# ./install.sh --nas and started by hyprdeb-nas.socket (one instance per connection, as root, hardened: see hyprdeb-nas@.service).
+#
+# Two ways in, nothing else:
+#   1. the socket (/run/hyprdeb-nas.sock, group sudo): the peer is identified by SO_PEERCRED (pid, uid), the request is validated,
+#      and then polkit is asked (pkcheck, action org.hyprdeb.nas.manage, subject = pid + process start time + uid). The password
+#      dialog appears in the user's desktop session. This path NEVER skips the polkit check.
+#   2. run directly by root (install.sh --nas through sudo): stdin is not a socket and the real uid is 0. The mount owner comes
+#      from the "uid" field of the request (only accepted on this path).
+# The request is ONE JSON object on one line (at most 16 KiB, read within 30 s). The password (add/edit/test) is a field of that
+# object: it arrives on stdin and goes to the credentials file (root 0600) or to smbclient's stdin: never to argv, environment,
+# a log or a reply. Verbs: add, edit, remove, test, migrate. Replies are JSON lines: {"ok": true, "message": ..., "notes": [...]}
+# or {"ok": false, "code": ..., "error": ...}.
+#
+# Files (all written atomically, root 0600 for credentials):
+#   /etc/hyprdeb/nas-NAME.credentials     username=... / password=...
+#   /etc/systemd/system/<escaped>.mount and .automount for /mnt/NAME; only the automount is enabled and started, never the mount,
+#   so nothing is mounted at boot and an unreachable NAS cannot delay boot or login. No fstab line.
+import fcntl
+import ipaddress
+import json
+import os
+import pwd
+import re
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+
+ETC = "/etc/hyprdeb"
+UNITS = "/etc/systemd/system"
+MNT = "/mnt"
+ACTION = "org.hyprdeb.nas.manage"
+LEGACY_CREDS = ETC + "/nas-credentials"       # older layout: the one share /mnt/nax kept its password here
+MARKER = "# hyprdeb managed"
+MAX_REQUEST = 16384
+READ_TIMEOUT = 30          # seconds to receive the request line
+AUTH_TIMEOUT = 150         # seconds for the whole polkit interaction (the password dialog)
+TOTAL_TIMEOUT = 330        # the whole request, whatever it is doing
+CMD_TIMEOUT = 60           # one systemctl call
+SMB_TIMEOUT = 15           # the smbclient test
+REACH_TIMEOUT = 5          # the TCP check before smbclient
+VERS = "3.0"               # SMB 3 (SMB1 is off on the NAS)
+MOUNT_TIMEOUT = 10         # seconds systemd waits for mount.cifs, so an unreachable NAS fails an `ls` quickly
+SHELL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,14}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+SHARE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+DURATION_RE = re.compile(r"^(\d+)([smh])$")
+FIELDS = {
+    "add": {"name", "server", "share", "username", "password", "idle_unmount", "uid"},
+    "edit": {"name", "server", "share", "username", "password", "idle_unmount", "uid"},
+    "remove": {"name", "uid"},
+    "test": {"name", "server", "share", "username", "password"},
+    "migrate": {"name", "uid"},
+}
+VERB_TEXT = {"add": "add", "edit": "change", "remove": "remove", "test": "test", "migrate": "update"}
+
+
+class Refuse(Exception):
+    """A request that is wrong or could not be done; code is for the caller, text is shown to the user."""
+
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code, self.text = code, text
+
+
+class Timeout(Exception):
+    pass
+
+
+def log(msg):
+    print(f"hyprdeb-nas: {msg}", file=sys.stderr, flush=True)
+
+
+def reply(obj):
+    """One JSON line on stdout, unbuffered: a client that already went away must not make the instance end as "failed"."""
+    data = (json.dumps(obj) + "\n").encode()
+    try:
+        while data:
+            data = data[os.write(1, data):]
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- validation (the root side trusts nothing)
+
+def idle_seconds(v):
+    if v == "off":
+        return 0
+    m = DURATION_RE.match(v)
+    if not m:
+        raise Refuse("invalid", 'idle time: "off" or a time from 30s to 24h like "10m"')
+    n = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+    if not 30 <= n <= 86400:
+        raise Refuse("invalid", 'idle time: "off" or a time from 30s to 24h like "10m"')
+    return n
+
+
+def check_server(v):
+    try:
+        ipaddress.IPv4Address(v)
+        return
+    except ValueError:
+        pass
+    if not HOST_RE.match(v) or len(v) > 253 or re.fullmatch(r"[\d.]+", v) or ".." in v:
+        raise Refuse("invalid", "server: an IPv4 address (like 192.0.2.20) or a host name (letters, digits, '.', '-')")
+
+
+def check_text(req, key, rx, what):
+    v = req.get(key)
+    if not isinstance(v, str) or not rx.match(v):
+        raise Refuse("invalid", what)
+    return v
+
+
+def check_password(v):
+    if not isinstance(v, str) or not v or len(v) > 128:
+        raise Refuse("invalid", "password: 1 to 128 characters")
+    if any(ord(c) < 32 or ord(c) == 127 for c in v):
+        raise Refuse("invalid", "password: no control characters or line breaks")
+    if v != v.strip():
+        raise Refuse("invalid", "password: no space at the start or end (mount.cifs and smbclient would drop it)")
+
+
+def parse_request(raw, direct):
+    """The validated request dict. Which fields are needed depends on the verb; nothing unknown is accepted."""
+    try:
+        req = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise Refuse("invalid", "the request is not valid JSON")
+    if not isinstance(req, dict) or not isinstance(req.get("verb"), str) or req["verb"] not in FIELDS:
+        raise Refuse("invalid", "unknown verb (add, edit, remove, test, migrate)")
+    verb = req["verb"]
+    extra = set(req) - FIELDS[verb] - {"verb"}
+    if extra:
+        raise Refuse("invalid", "unknown field(s): " + ", ".join(sorted(map(str, extra))))
+    if "uid" in req and not direct:
+        raise Refuse("invalid", "uid is only accepted when root runs the helper directly")
+    out = {"verb": verb}
+    if "name" in req or verb != "test":
+        out["name"] = check_text(req, "name", NAME_RE, "name: 1 to 15 characters from a-z, 0-9 and '-', starting with a letter or digit")
+    if verb in ("add", "edit", "test"):
+        server = req.get("server")
+        if not isinstance(server, str):
+            raise Refuse("invalid", "server is required")
+        check_server(server)
+        out["server"] = server
+        out["share"] = check_text(req, "share", SHARE_RE, "share: letters, digits, '_', '.', '-' (no slash, backslash or spaces)")
+        out["username"] = check_text(req, "username", USER_RE, "username: letters, digits, '_', '.', '-'")
+        if "password" in req and req["password"] != "":
+            check_password(req["password"])
+            out["password"] = req["password"]
+        elif verb == "add":
+            raise Refuse("invalid", "password is required for a new share")
+        elif verb == "test" and "name" not in out:
+            raise Refuse("invalid", "password is required to test a share that is not saved yet")
+    if verb in ("add", "edit"):
+        idle = req.get("idle_unmount", "10m")
+        if not isinstance(idle, str):
+            raise Refuse("invalid", 'idle time: "off" or a time like "10m"')
+        idle_seconds(idle)
+        out["idle_unmount"] = idle
+    if direct:
+        uid = req.get("uid")
+        if verb in ("add", "edit", "migrate", "remove") and (not isinstance(uid, int) or isinstance(uid, bool) or not 1000 <= uid < 60000):
+            raise Refuse("invalid", "uid: the user who owns the files on the share (1000..59999)")
+        out["uid"] = uid
+    return out
+
+
+# ---------------------------------------------------------------- files and units
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_atomic(path, data, mode):
+    """Write next to the target (O_EXCL, created with the final mode), fsync, rename over it. Returns True if it changed."""
+    b = data.encode() if isinstance(data, str) else data
+    try:
+        with open(path, "rb") as f:
+            if f.read() == b and stat.S_IMODE(os.fstat(f.fileno()).st_mode) == mode:
+                return False
+    except FileNotFoundError:
+        pass
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, b)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp)
+        raise
+    os.close(fd)
+    os.rename(tmp, path)
+    return True
+
+
+def restore(path, old):
+    """Put a file back as it was (old = (bytes, mode) or None = it did not exist)."""
+    try:
+        if old is None:
+            if os.path.exists(path):
+                os.unlink(path)
+        else:
+            write_atomic(path, old[0], old[1])
+    except OSError as e:
+        log(f"could not restore {path}: {e}")
+
+
+def snapshot(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(), stat.S_IMODE(os.fstat(f.fileno()).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def cred_path(name):
+    return f"{ETC}/nas-{name}.credentials"
+
+
+def unit_base(name):
+    r = subprocess.run(["systemd-escape", "-p", "--suffix=mount", f"{MNT}/{name}"], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0 or not r.stdout.strip().endswith(".mount"):
+        raise Refuse("failed", "systemd-escape failed")
+    return r.stdout.strip()[:-len(".mount")]
+
+
+def unit_paths(name):
+    base = unit_base(name)
+    return base, f"{UNITS}/{base}.mount", f"{UNITS}/{base}.automount"
+
+
+def is_managed(path):
+    t = read_text(path)
+    return t is not None and t.startswith(MARKER)
+
+
+def unit_texts(name, server, share, idle, uid, gid, cred):
+    what, where = f"//{server}/{share}", f"{MNT}/{name}"
+    head = (f"{MARKER}: NAS share {name}, written by hyprdeb-nas (settings window or `hyprdeb nas`).\n"
+            f"# Do not edit: changes are overwritten. The password is in {cred} (root only).\n")
+    mount = (head + f"[Unit]\nDescription=NAS share {what}\nAfter=network-online.target\nWants=network-online.target\n\n"
+             f"[Mount]\nWhat={what}\nWhere={where}\nType=cifs\n"
+             f"Options=credentials={cred},uid={uid},gid={gid},file_mode=0644,dir_mode=0755,vers={VERS},"
+             f"iocharset=utf8,_netdev,nofail\nTimeoutSec={MOUNT_TIMEOUT}\n")
+    auto = (head + f"[Unit]\nDescription=NAS share {what} on demand\n\n"
+            f"[Automount]\nWhere={where}\nTimeoutIdleSec={idle_seconds(idle)}\n\n[Install]\nWantedBy=multi-user.target\n")
+    return mount, auto
+
+
+def body(text):
+    """A unit without its comment lines (what systemd actually reads)."""
+    return "\n".join(l for l in (text or "").splitlines() if not l.startswith("#"))
+
+
+def parse_creds(path):
+    t = read_text(path)
+    if t is None:
+        return None
+    d = {}
+    for line in t.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k in ("username", "password") and k not in d:
+            d[k] = v
+    return d if "username" in d and "password" in d else None
+
+
+def ctl(*args, timeout=CMD_TIMEOUT):
+    try:
+        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refuse("failed", f"systemctl {args[0]} timed out")
+
+
+def ctl_ok(*args, timeout=CMD_TIMEOUT):
+    r = ctl(*args, timeout=timeout)
+    if r.returncode != 0:
+        raise Refuse("failed", f"systemctl {args[0]} failed: " + (r.stderr.strip().splitlines() or ["no message"])[-1][:200])
+    return r
+
+
+def is_active(unit):
+    return ctl("is-active", "--quiet", unit).returncode == 0
+
+
+def mount_point_ok(name):
+    """A new share may use /mnt/NAME only if it does not exist, or is an empty directory that nothing is mounted on."""
+    mp = f"{MNT}/{name}"
+    if os.path.islink(mp):
+        raise Refuse("exists", f"{mp} is a symbolic link: not used")
+    if os.path.lexists(mp):
+        if not os.path.isdir(mp):
+            raise Refuse("exists", f"{mp} exists and is not a directory")
+        if os.path.ismount(mp):
+            raise Refuse("exists", f"something else is already mounted on {mp}")
+        if os.listdir(mp):
+            raise Refuse("exists", f"{mp} exists and is not empty: not used")
+
+
+# ---------------------------------------------------------------- verbs
+
+def uid_gid(uid):
+    try:
+        return uid, pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        raise Refuse("invalid", "that user does not exist")
+
+
+def install_files(name, req, uid, gid, notes, password, cred):
+    """Write credentials + units for NAME; rolls everything back if a step fails. Returns (cred_changed, mount_changed, auto_changed)."""
+    base, mpath, apath = unit_paths(name)
+    old = {p: snapshot(p) for p in (cred, mpath, apath)}
+    mount, auto = unit_texts(name, req["server"], req["share"], req["idle_unmount"], uid, gid, cred)
+    try:
+        c = write_atomic(cred, f"username={req['username']}\npassword={password}\n", 0o600)
+        m = write_atomic(mpath, mount, 0o644)
+        a = write_atomic(apath, auto, 0o644)
+    except BaseException:
+        for p, o in old.items():
+            restore(p, o)
+        raise
+    return c, m, a, old
+
+
+def do_add(req, uid, gid):
+    name = req["name"]
+    base, mpath, apath = unit_paths(name)
+    cred = cred_path(name)
+    if any(os.path.lexists(p) for p in (mpath, apath, cred)) or (name == "nax" and os.path.lexists(LEGACY_CREDS)):
+        raise Refuse("exists", f"A NAS called {name} already exists: use Edit to change it.")
+    mount_point_ok(name)
+    notes = []
+    c, m, a, old = install_files(name, req, uid, gid, notes, req["password"], cred)
+    try:
+        ctl_ok("daemon-reload")
+        ctl_ok("enable", f"{base}.automount")
+        ctl_ok("start", f"{base}.automount")
+    except BaseException:
+        ctl("disable", f"{base}.automount")
+        for p, o in old.items():
+            restore(p, o)
+        ctl("daemon-reload")
+        raise
+    return {"message": f"NAS {name} added: //{req['server']}/{req['share']} on {MNT}/{name}. It connects when you open it.", "notes": notes}
+
+
+def migrate_files(name, notes):
+    """Legacy (nas-credentials) -> nas-NAME.credentials. Order matters so an automount triggered in between never fails:
+    copy first, then point the mount unit at the copy, reload, and only then delete the old file. The mount is not touched."""
+    base, mpath, apath = unit_paths(name)
+    text = read_text(mpath)
+    new = cred_path(name)
+    if text is None or not text.startswith(MARKER):
+        raise Refuse("missing", f"There is no NAS called {name} (or its unit was not written by hyprdeb).")
+    if LEGACY_CREDS + "," not in text:
+        if f"credentials={new}," in text:
+            return False
+        raise Refuse("failed", f"The unit of {name} uses a credentials file that hyprdeb does not know: left as it is.")
+    if not os.path.exists(new):
+        try:
+            with open(LEGACY_CREDS, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            raise Refuse("missing", f"{LEGACY_CREDS} is missing: edit the share and type its password again.")
+        write_atomic(new, data, 0o600)
+    old_unit = snapshot(mpath)
+    try:
+        write_atomic(mpath, text.replace(LEGACY_CREDS, new), 0o644)
+        ctl_ok("daemon-reload")
+    except BaseException:
+        restore(mpath, old_unit)
+        ctl("daemon-reload")
+        raise
+    try:
+        os.unlink(LEGACY_CREDS)
+    except FileNotFoundError:
+        pass
+    notes.append(f"The password file is now {new} (it was {LEGACY_CREDS}); the mount was not touched.")
+    return True
+
+
+def stored_login(name):
+    """The login a managed share really has on disk: its server (from the mount unit) with the user name and password (from its
+    credentials file). None if there is no such share or no password file."""
+    if not name:
+        return None
+    _, mpath, _a = unit_paths(name)
+    text = read_text(mpath)
+    if text is None or not text.startswith(MARKER):
+        return None
+    m = re.search(r"^What=//([^/\n]+)/", text, re.M)
+    creds = parse_creds(cred_path(name)) or (parse_creds(LEGACY_CREDS) if LEGACY_CREDS + "," in text else None)
+    if m is None or creds is None:
+        return None
+    return {"server": m.group(1), "username": creds["username"], "password": creds["password"]}
+
+
+def password_for(req):
+    """The password of a request. One typed in the request is used as is. Without one, the stored password of the share the request
+    NAMES is used only if the request keeps that share's server and user name exactly: a new share, or another server or user, never
+    gets a stored secret (it would be sent to a host the user did not enter the password for)."""
+    if req.get("password") is not None:
+        return req["password"]
+    stored = stored_login(req.get("name"))
+    if stored is None or stored["server"] != req["server"] or stored["username"] != req["username"]:
+        raise Refuse("invalid", "Type the password: the stored one is only used for the same NAS server and user name.")
+    return stored["password"]
+
+
+def do_migrate(req, uid, gid):
+    notes = []
+    changed = migrate_files(req["name"], notes)
+    return {"message": f"NAS {req['name']}: " + ("password file moved." if changed else "already up to date."), "notes": notes, "changed": changed}
+
+
+def do_edit(req, uid, gid):
+    name = req["name"]
+    base, mpath, apath = unit_paths(name)
+    cred = cred_path(name)
+    if not (is_managed(mpath) and is_managed(apath)):
+        raise Refuse("missing", f"There is no NAS called {name}.")
+    notes = []
+    migrate_files(name, notes)
+    password = password_for(req)
+    old_m, old_a = (read_text(mpath) or ""), (read_text(apath) or "")
+    c, m, a, old = install_files(name, req, uid, gid, notes, password, cred)
+    changed = c or m or a
+    # a rewritten comment header alone is not a change of the share: no note, no restart
+    m_real = m and body(read_text(mpath)) != body(old_m)
+    a_real = a and body(read_text(apath)) != body(old_a)
+    try:
+        if changed:
+            ctl_ok("daemon-reload")
+        if ctl("is-enabled", "--quiet", f"{base}.automount").returncode != 0:
+            ctl_ok("enable", f"{base}.automount")
+        mounted = is_active(f"{base}.mount")
+        if not is_active(f"{base}.automount"):
+            ctl_ok("start", f"{base}.automount")
+        elif a_real:
+            if mounted:
+                notes.append("The idle time applies after the share disconnects.")
+            else:
+                ctl_ok("restart", f"{base}.automount")
+        if (m_real or c) and mounted:
+            notes.append("The new server, share, user or password applies the next time it connects: Disconnect it now to use it.")
+    except BaseException:
+        for p, o in old.items():
+            restore(p, o)
+        ctl("daemon-reload")
+        raise
+    real = m_real or a_real or c
+    return {"message": f"NAS {name} " + ("updated." if real else "is already as requested."), "notes": notes, "changed": real}
+
+
+def do_remove(req, uid, gid):
+    """Stops the share (never forced: a busy share is refused and left as it was), then removes units, credentials and the empty mount point."""
+    name = req["name"]
+    base, mpath, apath = unit_paths(name)
+    cred = cred_path(name)
+    if not (is_managed(mpath) or is_managed(apath)):
+        raise Refuse("missing", f"There is no NAS called {name}.")
+    text = read_text(mpath) or ""
+    notes = []
+    # The mount goes first, with a plain umount: a busy share refuses (EBUSY) and nothing is touched. Stopping the automount first would
+    # detach a busy share lazily (systemd unmounts an automount with MNT_DETACH): a forced unmount in disguise.
+    if is_active(f"{base}.mount"):
+        ctl("stop", f"{base}.mount")
+        if is_active(f"{base}.mount"):
+            raise Refuse("busy", "The share is still in use: close the file manager windows and programs that have it open, then try again. "
+                                 "Nothing was removed.")
+    was_auto = is_active(f"{base}.automount")
+    ctl("stop", f"{base}.automount")
+    if is_active(f"{base}.mount"):                    # opened again in the moment between the two stops
+        if was_auto:
+            ctl("start", f"{base}.automount")
+        raise Refuse("busy", "The share was opened again while it was being removed: close what has it open, then try again. Nothing was removed.")
+    ctl("disable", f"{base}.automount")
+    for p in (apath, mpath, cred) + ((LEGACY_CREDS,) if LEGACY_CREDS in text else ()):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+    ctl("daemon-reload")
+    ctl("reset-failed", f"{base}.mount", f"{base}.automount")
+    mp = f"{MNT}/{name}"
+    try:
+        os.rmdir(mp)                                   # only an empty directory that is not a mount point
+    except FileNotFoundError:
+        pass
+    except OSError:
+        notes.append(f"{mp} was left because it is not empty.")
+    return {"message": f"NAS {name} removed. The files on the NAS were not touched.", "notes": notes}
+
+
+def explain_smb(out, server, share):
+    o = out.upper()
+    if any(s in o for s in ("LOGON_FAILURE", "WRONG_PASSWORD", "ACCESS_DENIED", "ACCOUNT_DISABLED", "ACCOUNT_LOCKED", "PASSWORD_EXPIRED", "ACCOUNT_RESTRICTION")):
+        return "The NAS refused the user name or password."
+    if "BAD_NETWORK_NAME" in o:
+        return f"The NAS has no share called {share}."
+    if any(s in o for s in ("CONNECTION_REFUSED", "HOST_UNREACHABLE", "NETWORK_UNREACHABLE", "IO_TIMEOUT", "CONNECTION_DISCONNECTED", "CONNECTION_RESET")):
+        return f"{server} does not answer on port 445 (is it on, and on the same network?)."
+    if any(s in o for s in ("PROTOCOL_NOT_SUPPORTED", "INVALID_NETWORK_RESPONSE", "NOT_SUPPORTED")):
+        return "The NAS does not offer SMB 3.0, which the connection needs."
+    return None
+
+
+def do_test(req, uid, gid):
+    """Server + share + login, checked as root with smbclient (the password goes to its stdin). Nothing is mounted or saved."""
+    server, share, user = req["server"], req["share"], req["username"]
+    password = password_for(req)
+    try:
+        socket.getaddrinfo(server, 445, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise Refuse("test", f"Cannot find {server}: check the name or address.")
+    try:
+        socket.create_connection((server, 445), timeout=REACH_TIMEOUT).close()
+    except OSError:
+        raise Refuse("test", f"{server} does not answer on port 445 (is it on, and on the same network?).")
+    # exactly the dialect the mount asks for (vers=3.0), so a server that would refuse the mount fails the test too
+    cmd = ["smbclient", f"//{server}/{share}", "-A", "/dev/stdin", "-p", "445", "--max-protocol=SMB3_00",
+           "--option=client min protocol=SMB3_00", "--option=name resolve order=host", "-c", "pwd"]
+    env = {"PATH": SHELL_PATH, "LC_ALL": "C", "HOME": "/tmp"}
+    try:
+        r = subprocess.run(cmd, input=f"username = {user}\npassword = {password}\n", capture_output=True, text=True, timeout=SMB_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise Refuse("test", f"{server} did not answer within {SMB_TIMEOUT} s.")
+    except FileNotFoundError:
+        raise Refuse("failed", "smbclient is not installed: run ./install.sh --nas")
+    if r.returncode == 0:
+        return {"message": f"OK: {server} answers, the share {share} exists and {user} may use it."}
+    out = (r.stdout + "\n" + r.stderr).replace(password, "***")
+    why = explain_smb(out, server, share)
+    if why is None:
+        last = [l.strip() for l in out.splitlines() if l.strip()]
+        why = "The test failed: " + (last[-1][:160] if last else f"smbclient exit {r.returncode}")
+    raise Refuse("test", why)
+
+
+VERBS = {"add": do_add, "edit": do_edit, "remove": do_remove, "test": do_test, "migrate": do_migrate}
+
+
+# ---------------------------------------------------------------- who is asking, and polkit
+
+def proc_start(pid):
+    """Start time of PID in clock ticks since boot (field 22 of /proc/PID/stat; the name may contain spaces and parentheses)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        raise Refuse("auth", "The program that asked has already gone.")
+
+
+def peer():
+    s = socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM)
+    pid, uid, gid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    s.close()
+    return pid, uid, gid
+
+
+def authorize(pid, uid, verb, name):
+    """Ask polkit with the race-safe subject (pid, start time read right after SO_PEERCRED, uid). The caller is blocked on the
+    socket, so its pid cannot be reused while we wait; the start time is checked again afterwards."""
+    start = proc_start(pid)
+    cmd = ["pkcheck", "--action-id", ACTION, "--process", f"{pid},{start},{uid}", "--allow-user-interaction",
+           "--detail", "verb", VERB_TEXT[verb], "--detail", "name", name or "(not saved yet)"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=AUTH_TIMEOUT, env={"PATH": SHELL_PATH, "LC_ALL": "C"})
+    except subprocess.TimeoutExpired:
+        raise Refuse("auth", "The administrator password was not entered in time.")
+    except FileNotFoundError:
+        raise Refuse("failed", "pkcheck is not installed (package polkitd).")
+    if proc_start(pid) != start:
+        raise Refuse("auth", "The program that asked has changed.")
+    if r.returncode == 0:
+        return
+    err = (r.stderr + r.stdout).lower()
+    if "dismissed" in err:                       # pkcheck: "Authentication request was dismissed." (Cancel in the dialog)
+        raise Refuse("auth", "Administrator authentication was cancelled.")
+    if "no authentication agent" in err or r.returncode == 2:
+        raise Refuse("auth", "No password dialog could be shown: use this from the desktop session (or run ./install.sh --nas in a terminal).")
+    raise Refuse("auth", "Administrator authentication failed (wrong password?). Check the keyboard layout: the password must be typed with the us layout.")
+
+
+def alarm_handler(signum, frame):
+    raise Timeout()
+
+
+def read_request():
+    buf = b""
+    signal.alarm(READ_TIMEOUT)
+    while b"\n" not in buf:
+        chunk = os.read(0, MAX_REQUEST + 1 - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > MAX_REQUEST:
+            raise Refuse("invalid", "the request is larger than 16 KiB")
+    signal.alarm(0)
+    if not buf.strip():
+        raise Refuse("invalid", "empty request")
+    return buf.split(b"\n", 1)[0]
+
+
+def main():
+    signal.signal(signal.SIGALRM, alarm_handler)
+    try:
+        issock = stat.S_ISSOCK(os.fstat(0).st_mode)
+    except OSError:
+        issock = False
+    direct = not issock
+    verb = name = who = None
+    try:
+        if direct and os.getuid() != 0:
+            raise Refuse("auth", "hyprdeb-nas runs from its socket, or directly only as root.")
+        raw = read_request()
+        pid = puid = pgid = None
+        if issock:
+            pid, puid, pgid = peer()
+            if puid == 0 or puid < 1000 or puid >= 60000:
+                raise Refuse("auth", "Only a normal user may use the socket (root runs hyprdeb-nas directly).")
+            proc_start(pid)                                  # it is still there; the check below uses this start time
+        req = parse_request(raw, direct)
+        raw = None
+        verb, name = req["verb"], req.get("name")
+        who = f"uid {puid}" if issock else f"root for uid {req.get('uid')}"
+        signal.alarm(TOTAL_TIMEOUT)
+        if issock:
+            authorize(pid, puid, verb, name)               # never skipped on the socket path
+            uid, gid = uid_gid(puid)
+        else:
+            uid, gid = uid_gid(req["uid"]) if req.get("uid") is not None else (None, None)
+        try:
+            dfd = os.open(ETC, os.O_RDONLY | os.O_DIRECTORY)   # one request at a time changes shares (flock on the directory)
+        except FileNotFoundError:
+            raise Refuse("failed", f"{ETC} is missing: run ./install.sh --nas")
+        fcntl.flock(dfd, fcntl.LOCK_EX)
+        try:
+            res = VERBS[verb](req, uid, gid)
+        finally:
+            os.close(dfd)
+        res["ok"] = True
+        log(f"{verb} {name or '-'} by {who}: ok")
+        reply(res)
+    except Refuse as e:
+        log(f"{verb or '?'} {name or '-'} by {who or '?'}: refused ({e.code}): {e.text}")
+        reply({"ok": False, "code": e.code, "error": e.text})
+    except Timeout:
+        log(f"{verb or '?'} {name or '-'}: timed out")
+        reply({"ok": False, "code": "timeout", "error": "The request took too long and was stopped."})
+    except Exception as e:      # never a traceback on the wire or in the journal: the request holds a password
+        log(f"{verb or '?'} {name or '-'}: internal error {type(e).__name__}")
+        reply({"ok": False, "code": "failed", "error": f"Internal error ({type(e).__name__}); details are not logged."})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

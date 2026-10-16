@@ -1,0 +1,45 @@
+# Desktop packages. One per line, '#' starts a comment.
+# Installed with: apt install -t trixie-backports <list>
+# apt only takes the backports version where one exists, otherwise stable.
+
+# Compositor and Hypr* tools (Hyprland 0.55.x lives in trixie-backports)
+hyprland
+hyprlock
+hypridle
+hyprpaper            # wallpaper daemon (0.8.x, backports only)
+hyprpolkitagent
+hyprlauncher
+hyprsunset
+hyprpicker
+xdg-desktop-portal-hyprland
+hyprland-guiutils    # runtime dependency for some Hyprland dialogs (Hyprland warns without it)
+
+# Shell / UI
+quickshell
+waybar
+mako-notifier
+kitty
+fuzzel
+
+# Clipboard, screenshots, notifications
+wl-clipboard
+cliphist
+grim
+slurp
+libnotify-bin
+
+# Bluetooth
+bluez                 # bluetoothd + bluetoothctl
+libspa-0.2-bluetooth  # PipeWire BT audio; must match pipewire, so it has to come from backports like pipewire 1.6.9
+blueman               # GUI manager + tray applet (Debian main; overskride is not packaged)
+
+# Audio
+pipewire
+pipewire-pulse
+wireplumber
+playerctl     # media keys (XF86Audio*) in the default Hyprland binds
+
+# Fonts (Font Awesome 4.7 only covers some waybar icons; Nerd Font is a TODO)
+fonts-jetbrains-mono
+fonts-noto-color-emoji
+fonts-font-awesome

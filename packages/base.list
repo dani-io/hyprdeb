@@ -1,0 +1,10 @@
+# Base tools needed by install.sh and day-to-day work.
+sudo
+git
+curl
+ca-certificates
+mokutil
+gnupg
+python3
+python3-gi
+python3-tomlkit

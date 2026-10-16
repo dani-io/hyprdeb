@@ -1,0 +1,4 @@
+# Claude Desktop Cowork VM prerequisites (install.sh --cowork); see docs/gotchas.md (Cowork).
+qemu-system-x86
+ovmf
+virtiofsd

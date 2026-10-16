@@ -1,0 +1,5 @@
+#%PAM-1.0
+# hyprdeb managed: install.sh --greeter writes this file to /etc/pam.d/greetd (the packaged one is backed up once as greetd.bak.<timestamp>).
+# Same as a tty login (so the session and the keyring behave exactly as today). The packaged file also had pam_gnome_keyring /
+# pam_kwallet5 lines; they are left out on purpose: the keyring is Default_Keyring, not "login", and is not PAM-unlocked today.
+@include login

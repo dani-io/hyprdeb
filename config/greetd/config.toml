@@ -1,0 +1,9 @@
+# hyprdeb managed: install.sh --greeter writes this file (the packaged one is backed up once as config.toml.bak.<timestamp>).
+# greetd runs the greeter (tuigreet) on VT 7 as _greetd; after a login it runs the session command as that user.
+# Undo: sudo systemctl disable greetd, then reboot (tty1 login + start-hyprland as before). See docs/recovery.md.
+[terminal]
+vt = 7
+
+[default_session]
+command = "tuigreet --time --remember --asterisks --greeting hyprdeb --cmd /usr/local/bin/hyprdeb-session"
+user = "_greetd"

@@ -1,0 +1,5 @@
+# Printing (opt-in: ./install.sh --printing), installed with --no-install-recommends: no avahi, no cups-browsed.
+# libcupsimage2t64 is needed by the Canon LBP6030 filter rastertosfp (its .deb declares no dependencies); harmless otherwise.
+cups
+cups-client
+libcupsimage2t64

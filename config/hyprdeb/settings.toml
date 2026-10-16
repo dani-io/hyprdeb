@@ -1,0 +1,103 @@
+# hyprdeb settings. This file is yours: install.sh creates it once and never overwrites it.
+# After editing, run:  hyprdeb check   (validate)   and   hyprdeb apply   (generate + reload Hyprland).
+# Unknown keys and wrong types are errors. Everything below is commented out = nothing is configured.
+#
+# Monitors. One [[monitors]] block per output you want to configure. Outputs without a block keep
+# Hyprland's default (preferred mode, automatic position, automatic scale).
+# Note: "auto" places an output to the right of the others, so when you pin one monitor, pin the others too.
+#
+# [[monitors]]
+# match    = "desc:Vendor Model Name"   # required. "desc:<description>" (preferred: it follows the monitor
+#                                        # between ports/machines; see `hyprctl monitors`) or an output name like "DP-1"
+# mode     = "preferred"         # "preferred" (default), "highres", "highrr", "1920x1080" or "1920x1080@60"
+# position = "auto"              # "auto" (default) or "1920x0" (pixels, X x Y; may be negative)
+# scale    = 1                   # number > 0. Omit for Hyprland's automatic scale
+# disabled = false               # true turns the output off (mode/position/scale are then ignored)
+#
+# Idle. Absent = lock after 10m, screen off after 15m (what hyprdeb shipped before). Applied by restarting hypridle.
+#
+# [idle]
+# lock_after       = "10m"    # "off" or a duration: "90s", "10m", "1h" (minimum 30s)
+# screen_off_after = "15m"    # "off" or a duration; must be longer than lock_after when both are on
+#
+# Wallpaper. Absent = ~/.config/hypr/wallpaper.png, cover. Applied by restarting hyprpaper.
+#
+# [wallpaper]
+# path = "~/.config/hypr/wallpaper.png"   # an image file (absolute or starting with ~); must exist and be readable
+# fit  = "cover"                          # cover, contain, tile or fill
+#
+# Keyboard. Absent = the US layout only. More layouts are listed here; with two or more, `toggle` is the key that switches them.
+# Names are checked against the xkb list. The first layout must be Latin (the lock screen switches to layout 0 before locking).
+# Applied by a Hyprland reload. Example: US plus Persian (Windows layout), Caps Lock switches:
+#
+# [keyboard]
+# layouts  = ["us", "ir"]
+# variants = ["", "winkeys"]   # same length as layouts; "" = the layout's default variant
+# toggle   = "caps"            # caps, alt_shift or win_space (ignored with a single layout)
+#
+# Mouse and keyboard options (global, all optional: a key that is absent writes nothing, so Hyprland keeps its own value).
+# Applied by a Hyprland reload. Hyprland 0.55.2 option names in brackets. natural_scroll and scroll_speed are for mice; Hyprland has
+# separate touchpad options (input.touchpad.*) that hyprdeb does not set.
+#
+# [mouse]
+# speed          = 0.0         # -1.0 .. 1.0 (0 = no change)                    [input.sensitivity]
+# acceleration   = "adaptive"  # "adaptive" or "flat"                            [input.accel_profile]
+# natural_scroll = false       # true / false                                    [input.natural_scroll]
+# scroll_speed   = 1.0         # 0.1 .. 10 (hyprdeb's bounds), 1 = normal        [input.scroll_factor]
+# left_handed    = false       # true swaps the left and right buttons           [input.left_handed]
+# focus_follows  = "always"    # "always" (follow_mouse 1: hovering focuses) or "click" (follow_mouse 2: only a click
+#                              # moves keyboard focus)                           [input.follow_mouse]
+#
+# [keyboard]  (more keys, next to layouts / variants / toggle above)
+# repeat_rate    = 25          # 1 .. 100 repeats per second (hyprdeb's bounds)  [input.repeat_rate]
+# repeat_delay   = 600         # 100 .. 2000 ms before repeating starts          [input.repeat_delay]
+# numlock        = true        # NumLock on (keyboards with a numpad). Only ever turns it ON: false or absent does NOT turn it
+#                              # off again (checked: a reload leaves the state as it is)  [input.numlock_by_default]
+#
+# Notifications (mako, all optional; absent = the repo default). Applied with `makoctl reload`; mako is never restarted.
+#
+# [notifications]
+# timeout = "5s"               # how long a notification stays: "3s", "10s", "2m" ... (1s .. 60m) or "off" (stays until
+#                              # dismissed). Low urgency is at most 3s, critical never expires, blueman is always 3s.
+# opacity = 0.9                # 0.5 .. 1.0, background opacity (blur sits behind it)
+# font    = "Vazirmatn"        # one installed font family (checked with fc-list), e.g. the IRAN Sans family name once its
+#                              # files are in ~/.local/share/fonts; Vazirmatn is always the fallback behind it
+# dnd     = false              # do not disturb: true hides notifications (history keeps them). Also SUPER+ALT+N, the
+#                              # waybar indicator, `hyprdeb dnd toggle`. Absent = leave mako's mode alone.
+#
+# NAS shares (opt-in: ./install.sh --nas). Each share is a CIFS systemd automount on /mnt/NAME: nothing is mounted at boot, the first `ls`
+# of /mnt/NAME mounts it, and it unmounts after idle_unmount. The settings window's NAS page adds, edits, tests and removes them and writes
+# these tables for you (comments kept); you can also write them by hand and run ./install.sh --nas. The password is NOT a setting: it is typed
+# in the window (or asked by install.sh) and kept only in /etc/hyprdeb/nas-NAME.credentials (root, 0600) on that machine.
+#
+# [nas.media]                      # NAME: 1 to 15 characters from a-z, 0-9, '-' (also the folder /mnt/NAME)
+# server       = "192.0.2.10"       # IPv4 address or host name
+# share        = "Media"           # SMB share name (letters, digits, _ . -)
+# username     = "user"            # SMB user
+# idle_unmount = "10m"             # "30s" .. "24h" or "off" (default 10m)
+#
+# (An older layout with flat keys under [nas] (server, share, username, idle_unmount, mountpoint = "/mnt/nax") is still read as the share
+# "nax"; the first change from the window moves it into [nas.nax].)
+#
+# Printing (opt-in: ./install.sh --printing). One queue; the driver is one of three things:
+#   driverless IPP (most network printers made since ~2015):  printer_uri = "ipp://192.0.2.20/ipp/print"  (driver = "everywhere" is implied)
+#   a PPD file you already have, any vendor:                   ppd = "/usr/share/cups/model/your-printer.ppd"
+#   the Canon LBP6030w (raw port, Canon's own driver .deb installed first): printer_uri = "socket://192.0.2.20:9100", driver = "canon-lbp6030"
+# With a socket:// address and neither key, canon-lbp6030 is assumed. See docs/printing.md.
+#
+# [printing]
+# printer_name = "Office"                    # letters, digits, _ and - (the CUPS queue name)
+# printer_uri  = "ipp://192.0.2.20/ipp/print"
+# driver       = "everywhere"                # "everywhere" or "canon-lbp6030"; or use ppd = "/path/to.ppd" instead of driver
+# default      = true                        # make it the default printer
+#
+# Fonts (all optional). One family for Persian / Arabic script on the whole desktop: a generated fontconfig file
+# (~/.config/fontconfig/conf.d/60-hyprdeb-persian.conf) makes sans-serif = Noto Sans, then this family, then Vazirmatn. Latin text keeps
+# its font; monospace gets the same treatment (Noto Sans Mono for Latin, this family for Persian, so editors keep fixed-width code
+# and joined Persian). waybar follows the alias; mako follows it too unless you set [notifications] font, which then wins for every
+# character mako draws. Running apps need a restart.
+#
+# [fonts]
+# persian = "Vazirmatn"        # an installed family that covers Persian (fc-list :lang=fa family); default Vazirmatn
+#
+# Command line: hyprdeb show | get KEY | set KEY VALUE   (set keeps these comments; e.g. hyprdeb set idle.lock_after 5m)

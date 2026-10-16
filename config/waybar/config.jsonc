@@ -1,0 +1,74 @@
+// hyprdeb managed: this file is overwritten by install.sh (a differing existing file is backed up once).
+// Icons: Tabler Icons outline, written as \u escapes (names and codepoints: assets/fonts/tabler-icons/icons.map; the font family
+// "tabler-icons" is in style.css). \uea70 clock, \uebd6 keyboard, \ueb51 volume, \uf1c3 volume-off, \uea37 bluetooth,
+// \uecea bluetooth-connected, \ueb52 wifi, \uf09f network (ethernet), \uecfa wifi-off, \uef8e cpu, \ud800\udeb7 = U+102B7 memory.
+{
+    "layer": "top",
+    "height": 30,
+    "spacing": 6,
+    "modules-left": ["hyprland/workspaces", "hyprland/window"],
+    "modules-center": ["clock"],
+    "modules-right": ["custom/vpn", "custom/dnd", "hyprland/language", "pulseaudio", "bluetooth", "network", "cpu", "memory", "tray"],
+
+    "hyprland/workspaces": {
+        "format": "{id}",
+        "on-click": "activate",
+        "all-outputs": false
+    },
+    "hyprland/window": {
+        "max-length": 60,
+        "separate-outputs": true
+    },
+    "custom/vpn": {
+        "exec": "$HOME/.local/bin/hyprdeb vpn waybar --follow",
+        "return-type": "json",
+        "restart-interval": 5,
+        "on-click": "$HOME/.local/bin/hyprdeb gui --page vpn"
+    },
+    "custom/dnd": {
+        "exec": "$HOME/.local/bin/hyprdeb dnd waybar",
+        "return-type": "json",
+        "signal": 8,
+        "on-click": "$HOME/.local/bin/hyprdeb dnd toggle"
+    },
+    "hyprland/language": {
+        "format": "\uebd6 {short}"
+    },
+    "clock": {
+        "format": "\uea70 {:%a %H:%M}",
+        "format-alt": "\uea70 {:%Y-%m-%d %H:%M}",
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>"
+    },
+    "pulseaudio": {
+        "format": "\ueb51 {volume}%",
+        "format-muted": "\uf1c3 muted",
+        "on-click": "pavucontrol"
+    },
+    "bluetooth": {
+        "format": "\uea37 {status}",
+        "format-connected": "\uecea {device_alias}",
+        "format-connected-battery": "\uecea {device_alias} {device_battery_percentage}%",
+        "format-no-controller": "",
+        "tooltip-format": "{controller_alias}\t{controller_address}",
+        "tooltip-format-connected": "{controller_alias}\t{controller_address}\n\n{device_enumerate}",
+        "tooltip-format-enumerate-connected": "{device_alias}\t{device_address}",
+        "on-click": "blueman-manager"
+    },
+    "network": {
+        "interval": 5,
+        "format-wifi": "\ueb52 {essid} ({signalStrength}%)",
+        "format-ethernet": "\uf09f {ipaddr}/{cidr}",
+        "format-disconnected": "\uecfa offline",
+        "tooltip-format": "{ifname} {ipaddr}/{cidr}\nvia {gwaddr}\n\u2193 {bandwidthDownBytes}  \u2191 {bandwidthUpBytes}"
+    },
+    "cpu": {
+        "format": "\uef8e {usage}%",
+        "tooltip": false
+    },
+    "memory": {
+        "format": "\ud800\udeb7 {}%"
+    },
+    "tray": {
+        "spacing": 10
+    }
+}

@@ -1,0 +1,9 @@
+# Interactive shell tools. Only installed here; zsh/starship configuration is left to the user.
+zsh
+zsh-autosuggestions
+zsh-syntax-highlighting
+starship
+fzf
+zoxide
+eza
+bat

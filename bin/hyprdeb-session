@@ -1,0 +1,36 @@
+#!/bin/sh
+# hyprdeb managed: install.sh --greeter copies this to /usr/local/bin/hyprdeb-session (a differing existing file is backed up once).
+# The session command greetd runs after login (see /etc/greetd/config.toml). It must give Hyprland the same environment as typing
+# `start-hyprland` in a tty1 login does today: that is an INTERACTIVE login shell, and for zsh the PATH additions (~/.local/bin, go, pnpm,
+# ...) and variables (JAVA_HOME, ANDROID_HOME, ...) live only in ~/.zshrc, so `-l -c` alone would lose them. Hence `-l -i -c`.
+# An interactive shell has no terminal here: stdin is /dev/null and all output goes to the log, so nothing can wait for input.
+# Read the log from a spare VT (Ctrl+Alt+F3) or over SSH when a start fails: ~/.local/state/hyprdeb/session.log
+# Test hook: HYPRDEB_SESSION_CMD=env makes it print the environment instead of starting Hyprland.
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/hyprdeb/session.log"
+mkdir -p "$(dirname "$LOG")"
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 1048576 ]; then mv -f "$LOG" "$LOG.old"; fi
+exec >>"$LOG" 2>&1 </dev/null
+echo "=== $(date '+%F %T') hyprdeb-session: user=$(id -un) vt=${XDG_VTNR:-?} session=${XDG_SESSION_ID:-?}"
+
+SH="${SHELL:-}"
+[ -x "$SH" ] || SH="$(getent passwd "$(id -un)" | cut -d: -f7)"
+[ -x "$SH" ] || SH=/bin/sh
+# login(1) puts the games directories in PATH; greetd does not. Same base as the tty1 login, then the shell's own files add the rest.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"
+# login(1)'s PAM stack exports XDG_SESSION_CLASS; greetd's does not (logind itself reports class=user either way).
+export XDG_SESSION_CLASS="${XDG_SESSION_CLASS:-user}"
+set -- ${HYPRDEB_SESSION_CMD:-start-hyprland}
+case "$SH" in
+  */zsh)
+    # oh-my-zsh would ask "update? [Y/n]" and powerlevel10k's instant prompt writes to the terminal: switch both off for this shell only
+    # (names checked in the installed oh-my-zsh / p10k), and unset them before the session starts so they do not leak into Hyprland.
+    export DISABLE_AUTO_UPDATE=true DISABLE_UPDATE_PROMPT=true POWERLEVEL9K_INSTANT_PROMPT=off
+    # ~/.zshrc sets GPG_TTY=$(tty), which is "not a tty" here (the tty1 login had /dev/tty1): keep it a /dev path.
+    exec "$SH" -l -i -c 'unset DISABLE_AUTO_UPDATE DISABLE_UPDATE_PROMPT POWERLEVEL9K_INSTANT_PROMPT
+      case "$GPG_TTY" in /dev/*) ;; *) [ -n "$XDG_VTNR" ] && export GPG_TTY="/dev/tty$XDG_VTNR" ;; esac
+      exec "$@"' zsh "$@"
+    ;;
+  *)
+    exec "$SH" -l -i -c 'exec "$@"' sh "$@"
+    ;;
+esac

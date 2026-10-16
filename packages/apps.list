@@ -1,0 +1,17 @@
+# Everyday apps (stable repo unless noted). One per line, '#' starts a comment.
+thunar                  # file manager (default SUPER+E target is configured separately)
+thunar-archive-plugin
+file-roller
+obs-studio
+mpv
+pavucontrol
+firefox-esr             # fallback browser until Chrome stage exists
+xdg-utils
+xdg-user-dirs
+fonts-vazirmatn         # Persian UI font
+fonts-noto-core
+swappy                  # annotate screenshots (SHIFT+Print)
+gnome-keyring            # secret store; Claude Desktop needs it to keep the sign-in
+libpam-gnome-keyring      # unlocks the keyring at login
+seahorse                  # GUI to inspect/unlock keyrings
+kate                      # text editor (KDE; pulls Qt/KF6 libraries, see docs/gotchas.md)

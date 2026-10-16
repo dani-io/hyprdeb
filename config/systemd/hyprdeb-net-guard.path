@@ -1,0 +1,10 @@
+# hyprdeb managed: starts the guard when `hyprdeb net apply` leaves a token (see bin/hyprdeb-net-guard).
+[Unit]
+Description=hyprdeb: a network change is waiting for confirmation
+
+[Path]
+PathExists=/run/hyprdeb-net/pending.json
+Unit=hyprdeb-net-guard.service
+
+[Install]
+WantedBy=multi-user.target

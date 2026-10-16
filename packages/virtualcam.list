@@ -1,0 +1,3 @@
+# OBS Virtual Camera (install.sh --virtualcam). v4l2loopback-dkms is in trixie main; DKMS needs kernel headers.
+linux-headers-amd64
+v4l2loopback-dkms

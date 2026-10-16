@@ -1,0 +1,10 @@
+# hyprdeb managed: install.sh overwrites this file (~/.config/swappy/config).
+# swappy 1.5.1 (SHIFT+Print). Without a config it saved silently into $HOME: there is no ~/Desktop and no
+# ~/.config/user-dirs.dirs on this machine. Option names from `man swappy` (CONFIG FILE section).
+[Default]
+# Same folder as CTRL+Print (install.sh creates it); $HOME is expanded by swappy.
+save_dir=$HOME/Pictures/Screenshots
+# Sorts next to the CTRL+Print files (%Y%m%d-%H%M%S.png); the suffix marks the edited ones.
+save_filename_format=%Y%m%d-%H%M%S-swappy.png
+# Close swappy after Ctrl+S (save) or Ctrl+C (copy).
+early_exit=true

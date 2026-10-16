@@ -1,0 +1,4 @@
+# NAS shares (opt-in: ./install.sh --nas): cifs-utils for mount.cifs, smbclient for the Test button, polkitd for pkcheck
+cifs-utils
+smbclient
+polkitd

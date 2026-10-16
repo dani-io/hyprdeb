@@ -1,0 +1,34 @@
+# hyprdeb managed: this file is overwritten by install.sh (a differing existing file is backed up once).
+# The look (palette) matches waybar and hyprlock. Timeout, opacity and font come from settings.toml ([notifications]) through the
+# generated include below (`hyprdeb apply` rewrites it); it must stay FIRST so the sections below keep their order, and it
+# must exist (mako refuses to load a config with a missing include; install.sh creates it).
+include=~/.config/mako/hyprdeb-settings
+
+max-visible=3
+width=360
+margin=12
+padding=12
+anchor=top-right
+border-size=2
+border-radius=10
+border-color=#788cb4e6
+text-color=#e6e6e6
+max-icon-size=48
+max-history=20
+
+[urgency=low]
+text-color=#9aa0b0
+
+# Critical notifications (also hyprdeb's own errors) stay until dismissed.
+[urgency=critical]
+border-color=#c0392b
+default-timeout=0
+
+# blueman announces every Bluetooth device connect/disconnect (app-name "blueman"); keep those short.
+[app-name=blueman]
+default-timeout=3000
+
+# do-not-disturb (SUPER+ALT+N, `hyprdeb dnd toggle`): nothing is shown; missed ones are in `makoctl history`. Restore them with
+# SUPER+SHIFT+N (`hyprdeb restore`), not plain `makoctl restore`, which crashes mako 1.10.0 for those.
+[mode=do-not-disturb]
+invisible=1

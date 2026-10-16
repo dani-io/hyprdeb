@@ -1,0 +1,170 @@
+#!/usr/bin/python3 -I
+# hyprdeb managed: root guard for `hyprdeb net apply`. Installed to /usr/local/sbin by ./install.sh --networkmanager and started by
+# hyprdeb-net-guard.path when /run/hyprdeb-net/pending.json appears.
+#
+# The token is DATA, written by a user in the netdev group: it is parsed and validated here, every value is checked, only a
+# hyprdeb-<if> profile name is accepted, nmcli gets an argument list (never a shell). The guard waits for the deadline: if the token
+# was removed by then (= confirmed) it does nothing; else it puts the profile's old ipv4 values back and re-applies them.
+# A malformed token is removed with a log line. Runs as a normal system service, so it survives a dead GUI, terminal or session.
+import errno
+import grp
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+DIR = "/run/hyprdeb-net"
+TOKEN = DIR + "/pending.json"
+MAX_SECONDS = 310          # a deadline further away than this is refused
+# the interface part starts with a letter, digit or underscore: no ".", ".." or hidden names (/sys/class/net/.. exists)
+WG_PREFIX = "hyprdeb-wg-"
+PROFILE_RE = re.compile(r"^hyprdeb-([A-Za-z0-9_][A-Za-z0-9_.-]{0,14})$")
+
+
+def log(msg):
+    print(f"hyprdeb-net-guard: {msg}", flush=True)
+
+
+def ip4(v):
+    if not isinstance(v, str) or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", v):
+        raise ValueError(f"not an IPv4 address: {v!r}")
+    return ipaddress.IPv4Address(v)
+
+
+def netdev_gid():
+    try:
+        return grp.getgrnam("netdev").gr_gid
+    except KeyError:
+        return None
+
+
+def read_token():
+    """The validated token; FileNotFoundError when it is gone, ValueError when it is malformed.
+    One open() without following symlinks, then everything is checked on that file descriptor (no path is looked at twice)."""
+    try:
+        fd = os.open(TOKEN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError("the token is a symbolic link")
+        raise
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 4096:
+            raise ValueError("the token is not a regular file of at most 4 KiB")
+        if st.st_mode & stat.S_IWOTH or (st.st_uid != 0 and st.st_gid != netdev_gid()):
+            raise ValueError("the token is not owned by root or the netdev group, or is world-writable")
+        d = json.loads(f.read(4097).decode("utf-8"))
+    if not isinstance(d, dict) or set(d) != {"version", "profile", "iface", "deadline", "old"} or d["version"] != 1:
+        raise ValueError("unexpected fields")
+    m = PROFILE_RE.match(d["profile"]) if isinstance(d["profile"], str) else None
+    if not m or d["iface"] != m.group(1) or not os.path.isdir(f"/sys/class/net/{d['iface']}"):
+        raise ValueError("bad profile or interface name")
+    if d["profile"].startswith(WG_PREFIX):   # hyprdeb-wg-* are the VPN profiles, never an uplink profile
+        raise ValueError("hyprdeb-wg-* profiles are VPN profiles: refused")
+    if isinstance(d["deadline"], bool) or not isinstance(d["deadline"], int) or d["deadline"] > time.time() + MAX_SECONDS:
+        raise ValueError("bad deadline")
+    o = d["old"]
+    if not isinstance(o, dict) or set(o) != {"method", "addresses", "gateway", "dns", "ignore_auto_dns"}:
+        raise ValueError("bad old settings")
+    if o["method"] not in ("auto", "manual") or not isinstance(o["ignore_auto_dns"], bool):
+        raise ValueError("bad old method")
+    if not isinstance(o["addresses"], list) or len(o["addresses"]) > 1 or not isinstance(o["dns"], list) or len(o["dns"]) > 3:
+        raise ValueError("bad old lists")
+    for a in o["addresses"]:
+        i = ipaddress.IPv4Interface(a) if isinstance(a, str) and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}/\d{1,2}", a) else None
+        if i is None or not 8 <= i.network.prefixlen <= 30:
+            raise ValueError(f"bad old address {a!r}")
+    if o["gateway"] != "":
+        ip4(o["gateway"])
+    for x in o["dns"]:
+        ip4(x)
+    if o["method"] == "manual" and (len(o["addresses"]) != 1 or not o["gateway"]):
+        raise ValueError("manual needs one address and a gateway")
+    if o["method"] == "auto" and (o["addresses"] or o["gateway"]):
+        raise ValueError("auto must not have an address or a gateway")
+    return d
+
+
+def nm(*args, timeout=45):
+    return subprocess.run(["nmcli", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def revert(tok):
+    o, prof, iface = tok["old"], tok["profile"], tok["iface"]
+    # the profile must exist and belong to this interface (not just carry a matching name)
+    r = nm("-g", "connection.interface-name,connection.type", "connection", "show", "id", prof)
+    got = r.stdout.split("\n") if r.returncode == 0 else []
+    if len(got) < 2 or got[0].strip() != iface:
+        log(f"refusing: profile {prof} does not exist for {iface}")
+        return False
+    if got[1].strip() != "802-3-ethernet":   # only a wired uplink profile is ever changed here
+        log(f"refusing: profile {prof} is of type {got[1].strip()!r}, not 802-3-ethernet")
+        return False
+    args = ["connection", "modify", prof, "ipv4.method", o["method"], "ipv4.addresses", ",".join(o["addresses"]),
+            "ipv4.gateway", o["gateway"], "ipv4.dns", ",".join(o["dns"]), "ipv4.ignore-auto-dns", "yes" if o["ignore_auto_dns"] else "no"]
+    r = nm(*args)
+    if r.returncode != 0:
+        log(f"nmcli modify failed: {r.stderr.strip()}")
+        return False
+    ok = nm("device", "reapply", iface).returncode == 0
+    time.sleep(2)
+    state = nm("-g", "GENERAL.STATE", "device", "show", iface).stdout.strip()
+    if not ok or not state.startswith("100"):
+        log("reapply was not enough: reconnecting")
+        r = nm("-w", "25", "connection", "up", "id", prof)
+        if r.returncode != 0:
+            log(f"nmcli connection up failed: {r.stderr.strip()}")
+    for _ in range(20):
+        state = nm("-g", "GENERAL.STATE", "device", "show", iface).stdout.strip()
+        if state.startswith("100"):
+            log(f"reverted: {iface} is connected again with the old settings")
+            return True
+        time.sleep(1)
+    log(f"reverted the profile, but {iface} is not connected (state {state or 'unknown'})")
+    return False
+
+
+def main():
+    try:
+        d = os.stat(DIR)
+        if not stat.S_ISDIR(d.st_mode) or d.st_uid != 0:
+            log(f"{DIR} is not a root-owned directory: doing nothing")
+            return 1
+        tok = read_token()
+    except FileNotFoundError:
+        log("no token: nothing to do")
+        return 0
+    except (ValueError, OSError, UnicodeDecodeError, ipaddress.AddressValueError, json.JSONDecodeError) as e:
+        log(f"malformed token ignored and removed: {e}")
+        try:
+            os.unlink(TOKEN)
+        except OSError:
+            pass
+        return 0
+    deadline = tok["deadline"]
+    log(f"pending change on {tok['profile']}: reverts at {time.strftime('%H:%M:%S', time.localtime(deadline))} unless confirmed")
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            cur = read_token()
+            deadline = min(deadline, cur["deadline"])      # the user may shorten the wait (revert now), never extend it
+        except FileNotFoundError:
+            log("confirmed: the token was removed, nothing to revert")
+            return 0
+        except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass                                           # a damaged rewrite: keep the last good values
+    log("not confirmed: reverting")
+    ok = revert(tok)
+    try:
+        os.unlink(TOKEN)
+    except OSError:
+        pass
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

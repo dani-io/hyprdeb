@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# hyprdeb managed: install.sh overwrites this file (installed to ~/.local/bin/hyprdeb-lock).
+# Lock the Hyprland session, used by SUPER+L and hypridle lock_cmd (idle and before-sleep).
+#
+# The old guard "pidof hyprlock || hyprlock" did nothing when a stray hyprlock held no lock
+# (e.g. the loser of two hyprlocks started at once). This asks the compositor instead:
+# `hyprctl locked` (undocumented, not in --help) prints true/false. In Hyprland 0.55.2 it turns true as soon as a
+# client requests the session lock (before any lock frame is drawn) and stays true until a proper unlock, so it is
+# also true after hyprlock crashed. "Lock frames drawn" is what hypridle inhibit_sleep = 3 waits for, not this.
+#   false                              -> kill this session's stray hyprlocks, then lock
+#   true, a hyprlock of ours running   -> already locked, nothing to do
+#   true, no hyprlock of ours          -> hyprlock crashed (red screen): start a new one
+#                                         (needs misc.allow_session_lock_restore, set in lock.lua)
+#   anything else (error, empty, ...)  -> fail closed: start hyprlock, but kill nothing
+# "Lock" = switch to layout 0 (us; a Persian-layout password is refused) and start hyprlock.
+# An flock serialises concurrent calls (key press + idle timeout) until the lock is requested.
+# Always exits within about 10 s: every hyprctl call has a 1 s timeout, all waits use one deadline.
+#
+# Each call appends one line to $XDG_RUNTIME_DIR/hyprdeb-lock.log (tmpfs, cleared at logout/reboot).
+# Test hooks: HYPRDEB_LOCKED_CMD replaces "hyprctl locked"; HYPRDEB_LOCK_DRY=1 prints actions only.
+set -u
+
+LOGF="${XDG_RUNTIME_DIR:-/tmp}/hyprdeb-lock.log"
+T0=$(date +%s%N)
+DEADLINE=$(( $(date +%s) + 8 ))
+before_deadline() { [ "$(date +%s)" -lt "$DEADLINE" ]; }
+note() { printf '%s pid=%s %s\n' "$(date '+%F %T.%3N')" "$$" "$*" >> "$LOGF" 2>/dev/null; }
+
+state() {
+  case "$(timeout 1 ${HYPRDEB_LOCKED_CMD:-hyprctl locked} 2>/dev/null)" in
+    true) echo locked ;; false) echo unlocked ;; *) echo unknown ;;
+  esac
+}
+
+# hyprlock processes of this Hyprland session only (another session's hyprlock may hold its lock).
+own_hyprlocks() {
+  local pid
+  for pid in $(pgrep -x -u "$(id -u)" hyprlock); do
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" && echo "$pid"
+  done
+}
+
+act() { if [ "${HYPRDEB_LOCK_DRY:-0}" = 1 ]; then echo "would: $*"; else "$@"; fi; }
+
+kill_strays() {
+  local strays; strays="$(own_hyprlocks)"
+  [ -n "$strays" ] || return 0
+  act kill $strays
+  [ "${HYPRDEB_LOCK_DRY:-0}" = 1 ] && return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(own_hyprlocks)" ] && return 0; before_deadline || break; sleep 0.2; done
+  strays="$(own_hyprlocks)"; [ -n "$strays" ] && kill -9 $strays 2>/dev/null
+  return 0
+}
+
+start_lock() {
+  act timeout 1 hyprctl -q switchxkblayout all 0
+  if [ "${HYPRDEB_LOCK_DRY:-0}" = 1 ]; then echo "would: hyprlock"; return 0; fi
+  hyprlock 9>&- &                  # must not inherit the flock fd
+  # Hold the flock until the lock is requested (bounded by the deadline), so a second call sees "locked".
+  while before_deadline; do [ "$(state)" = locked ] && break; sleep 0.2; done
+  note "hyprlock started; state now $(state) after $(( ($(date +%s%N) - T0) / 1000000 )) ms"
+}
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/hyprdeb-lock.lock"
+flock -w 2 9 || { note "flock timeout: locking anyway"; start_lock; exit 0; }   # fail closed
+
+st="$(state)"; own="$(own_hyprlocks | paste -sd,)"
+note "called; state=$st own_hyprlocks=[${own}]"
+case "$st" in
+  locked)   if [ -n "$own" ]; then note "already locked: nothing to do"; else note "locked, no hyprlock (crash): restarting"; start_lock; fi ;;
+  unlocked) [ -n "$own" ] && note "killing strays [$own]"; kill_strays; start_lock ;;
+  *)        note "unknown state: failing closed"; start_lock ;;
+esac
+exit 0

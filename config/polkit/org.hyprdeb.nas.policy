@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- hyprdeb managed: the one polkit action behind the NAS page (add, change, test, remove a share). hyprdeb-nas asks for it with
+     pkcheck for the process that connected to its socket. The dialog text comes from <message>; verb and name are checked words. -->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>hyprdeb</vendor>
+  <action id="org.hyprdeb.nas.manage">
+    <description>Add, change, test or remove a NAS share</description>
+    <message>Authentication is required to $(verb) the NAS share $(name)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

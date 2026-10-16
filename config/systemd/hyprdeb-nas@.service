@@ -1,0 +1,38 @@
+# hyprdeb managed: one NAS helper request (hyprdeb-nas.socket starts an instance per connection; the connection is stdin/stdout).
+# It runs as root but may only write /etc/hyprdeb, /etc/systemd/system and /mnt; the rest of the system is read-only to it and it has
+# no capabilities: the files are root's own, systemctl talks to systemd over D-Bus and smbclient needs TCP plus a read-only netlink socket
+# (AF_NETLINK: without it smbclient cannot list the network interfaces and stops before connecting).
+[Unit]
+Description=hyprdeb NAS helper (%i)
+
+[Service]
+ExecStart=/usr/local/sbin/hyprdeb-nas
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=400
+TimeoutStopSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/hyprdeb /etc/systemd/system /mnt
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RemoveIPC=yes

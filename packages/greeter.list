@@ -1,0 +1,3 @@
+# Login screen (install.sh --greeter): greetd and its text greeter
+greetd
+tuigreet

@@ -1,0 +1,7 @@
+# Flatpak apps installed by install.sh --flatpak (system-wide, from Flathub). One application id per line.
+# Only missing apps are installed; an app that is not listed here is never removed.
+# Account, server URL and vault data are set inside the apps, never here.
+com.bitwarden.desktop   # password manager (self-hosted server is set in the app)
+org.telegram.desktop
+org.gnome.Loupe   # image viewer (default for images, see the defaultapps stage)
+org.gnome.Papers  # document viewer (default for PDF)

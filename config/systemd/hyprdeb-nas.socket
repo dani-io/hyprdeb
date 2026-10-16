@@ -1,0 +1,17 @@
+# hyprdeb managed: the socket of the NAS helper. One root helper process per connection (hyprdeb-nas@.service); every request is
+# checked with polkit by the helper itself, so the group only decides who may knock. At most 6 helpers at once and 3 per user
+# (one may still be closing when the next request comes); a client that sends nothing is cut off after 30 s by the helper.
+[Unit]
+Description=hyprdeb NAS helper socket
+
+[Socket]
+ListenStream=/run/hyprdeb-nas.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=sudo
+Accept=yes
+MaxConnections=6
+MaxConnectionsPerSource=3
+
+[Install]
+WantedBy=sockets.target

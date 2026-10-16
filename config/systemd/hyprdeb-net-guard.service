@@ -1,0 +1,12 @@
+# hyprdeb managed: waits for the deadline of a pending network change and reverts it unless it was confirmed.
+[Unit]
+Description=hyprdeb: revert an unconfirmed network change
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hyprdeb-net-guard
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes

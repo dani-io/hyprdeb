@@ -1,0 +1,5 @@
+# install.sh --networkmanager: NetworkManager without its Recommends (modemmanager, ppp, usb-modeswitch, dnsmasq-base are not needed).
+# Installed with --no-install-recommends, so the two Recommends we do want are listed here.
+network-manager
+wpasupplicant
+wireless-regdb

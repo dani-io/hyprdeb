@@ -1,0 +1,5 @@
+# NVIDIA proprietary driver (Debian 13 ships 550.x). Needs contrib + non-free.
+linux-headers-amd64
+nvidia-driver
+firmware-misc-nonfree
+nvidia-suspend-common   # nvidia-suspend/resume/hibernate.service (VRAM save around sleep)
