@@ -11,6 +11,7 @@
 #   ./install.sh --greeter        also set up the greetd login screen (tuigreet); opt-in, takes effect at the next boot; read docs/recovery.md first
 #   ./install.sh --nas            also set up the NAS shares from [nas.NAME] in settings.toml (CIFS, systemd automount, root helper; asks for new passwords)
 #   ./install.sh --printing       also set up printing: CUPS and the queue from [printing] in settings.toml (driverless IPP, a PPD you have, or Canon's own driver .deb installed first: see docs/printing.md)
+#   ./install.sh --virt           also set up local virtual machines: libvirt + virt-manager with the default NAT network (see docs/virt.md)
 #   ./install.sh --flatpak        also install Flatpak with the Flathub remote and the apps in packages/flatpak-apps.list (system-wide)
 #   ./install.sh --networkmanager  also move the wired uplink from ifupdown/dhcpcd to NetworkManager (opt-in; rollback timer armed, read docs/recovery.md first)
 #   ./install.sh --networkmanager-rollback  undo it: ifupdown/dhcpcd again, NetworkManager disabled
@@ -24,7 +25,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODENAME="trixie"
-DRY=0; NVIDIA=0; CONFIG_ONLY=0; CHROME=1; NO_CHROME_GIVEN=0; ONLY=""; LIST_STAGES=0; VSCODE=0; COWORK=0; NAS=0; PRINTING=0; GREETER=0; FLATPAK=0; VIRTUALCAM=0; NETWORKMANAGER=0; NM_ROLLBACK=0; NM_TIMER=10; TZ_WANT=""
+DRY=0; NVIDIA=0; CONFIG_ONLY=0; CHROME=1; NO_CHROME_GIVEN=0; ONLY=""; LIST_STAGES=0; VSCODE=0; COWORK=0; NAS=0; PRINTING=0; VIRT=0; GREETER=0; FLATPAK=0; VIRTUALCAM=0; NETWORKMANAGER=0; NM_ROLLBACK=0; NM_TIMER=10; TZ_WANT=""
 BASE_LUA="${HYPRDEB_BASE_LUA:-/usr/share/hypr/hyprland.lua}"   # Debian-shipped default
 CONF_DIR="${HOME}/.config/hypr"
 BEGIN="-- >>> hyprdeb managed >>>"
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
     --cowork) COWORK=1 ;;
     --nas) NAS=1 ;;
     --printing) PRINTING=1 ;;
+    --virt) VIRT=1 ;;
     --greeter) GREETER=1 ;;
     --flatpak) FLATPAK=1 ;;
     --virtualcam) VIRTUALCAM=1 ;;
@@ -646,6 +648,83 @@ stage_printing() {
   fi
 }
 
+# Local virtual machines: libvirt's system daemon (qemu:///system), virt-manager and the default NAT network (virbr0, 192.168.122.0/24).
+# NAT only: a bridge to the LAN would touch the uplink (see docs/recovery.md). libvirt turns on net.ipv4.ip_forward while the network runs and
+# adds its own firewall rules for virbr0; guest traffic leaves through the host's default route, i.e. through a VPN tunnel when one is on.
+VIRT_GUESTS=/etc/default/libvirt-guests
+VIRT_BEGIN="# >>> hyprdeb managed >>>"
+VIRT_END="# <<< hyprdeb managed <<<"
+virt_guests_block() {
+  printf '%s\n' "$VIRT_BEGIN" \
+    "# install.sh --virt: running guests are shut down (not suspended to disk) when the host shuts down; ON_SHUTDOWN waits at most SHUTDOWN_TIMEOUT seconds." \
+    "ON_BOOT=ignore" "ON_SHUTDOWN=shutdown" "SHUTDOWN_TIMEOUT=30" "$VIRT_END"
+}
+stage_virt() {
+  [ "$VIRT" = 1 ] || return 0
+  log "Local virtual machines (libvirt + virt-manager, NAT network only)"
+  [ -e /dev/kvm ] || warn "/dev/kvm does not exist (no hardware virtualisation, or it is off in the firmware): guests would run without KVM, very slowly"
+  # shellcheck disable=SC2046
+  sys apt-get install -y --no-install-recommends $(pkgs virt)
+  # The daemon: the packages enable it; make sure it runs now, so the network below can be checked.
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] make sure libvirtd.service is enabled and running"
+  else
+    systemctl is-enabled --quiet libvirtd.service 2>/dev/null || sys systemctl enable libvirtd.service
+    systemctl is-active --quiet libvirtd.service 2>/dev/null || sys systemctl start libvirtd.service
+  fi
+  # Group libvirt: the daemon's socket is root:libvirt 0770. It applies after a full re-login.
+  if [ "$DRY" = 1 ] && ! getent group libvirt >/dev/null; then
+    echo "  [dry-run] would add $USER to the libvirt group (the package creates it; applies after a full re-login)"
+  elif ! getent group libvirt | cut -d: -f4 | tr ',' '\n' | grep -qx "$USER"; then
+    sys usermod -aG libvirt "$USER"
+    [ "$DRY" = 1 ] || warn "$USER was added to the libvirt group: it applies after a full re-login (until then use: sudo virsh -c qemu:///system ..., and virt-manager cannot connect)"
+  fi
+  # /etc/default/libvirt-guests: one managed block, the packaged file backed up once as .bak.
+  local tmp new
+  tmp="$(mktemp)"; new="$(mktemp)"
+  if [ -f "$VIRT_GUESTS" ]; then
+    awk -v b="$VIRT_BEGIN" -v e="$VIRT_END" '$0==b{skip=1; next} $0==e{skip=0; next} !skip{print}' "$VIRT_GUESTS" > "$tmp"
+    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp"
+  fi
+  { cat "$tmp"; [ ! -s "$tmp" ] || echo; virt_guests_block; } > "$new"
+  if [ -f "$VIRT_GUESTS" ] && cmp -s "$new" "$VIRT_GUESTS"; then
+    log "$VIRT_GUESTS already has the managed block"
+  elif [ "$DRY" = 1 ]; then
+    echo "  [dry-run] set ON_BOOT=ignore, ON_SHUTDOWN=shutdown, SHUTDOWN_TIMEOUT=30 as a managed block in $VIRT_GUESTS (the packaged file is kept once as $VIRT_GUESTS.bak)"
+  else
+    if [ -f "$VIRT_GUESTS" ] && [ ! -e "$VIRT_GUESTS.bak" ]; then $SUDO cp -p "$VIRT_GUESTS" "$VIRT_GUESTS.bak"; fi
+    $SUDO install -m 644 "$new" "$VIRT_GUESTS"
+    log "$VIRT_GUESTS updated (applies at the next host shutdown)"
+  fi
+  rm -f "$tmp" "$new"
+  # The default network: defined, active and autostart (the package normally does the first and last; this makes sure of all three).
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] make sure the libvirt network 'default' exists, is active and starts with libvirtd (virsh net-start / net-autostart)"
+  else
+    local v="virsh -c qemu:///system" info
+    if ! $SUDO $v net-info default >/dev/null 2>&1; then
+      if [ -f /usr/share/libvirt/networks/default.xml ]; then sys $v net-define /usr/share/libvirt/networks/default.xml
+      else warn "the libvirt network 'default' is missing and its template /usr/share/libvirt/networks/default.xml too"; fi
+    fi
+    info="$($SUDO $v net-info default 2>/dev/null || true)"
+    if [ -n "$info" ]; then
+      grep -Eq '^Active:[[:space:]]+yes' <<<"$info" || sys $v net-start default
+      grep -Eq '^Autostart:[[:space:]]+yes' <<<"$info" || sys $v net-autostart default
+    fi
+  fi
+  # virsh defaults to the system daemon (virt-manager already uses it): written once, never overwritten.
+  local lc="$HOME/.config/libvirt/libvirt.conf"
+  if [ -e "$lc" ]; then
+    log "$lc exists: left alone"
+  elif [ "$DRY" = 1 ]; then
+    echo "  [dry-run] write $lc (uri_default = \"qemu:///system\")"
+  else
+    mkdir -p "$(dirname "$lc")"
+    printf '# Written once by hyprdeb (install.sh --virt); yours now. virsh uses the system daemon by default.\nuri_default = "qemu:///system"\n' > "$lc"
+    log "$lc written"
+  fi
+}
+
 # Flatpak + Flathub as a system remote (/var/lib/flatpak): one installation for all users, updated by
 # one `flatpak update`. XDG_DATA_DIRS for the Hyprland session is handled by config/hypr/flatpak.lua.
 stage_flatpak() {
@@ -822,6 +901,10 @@ stage_lock() {
   local src="$REPO/config/hypr" f
   run mkdir -p "$CONF_DIR"
   deploy_file "$src/hyprlock.conf" "$CONF_DIR/hyprlock.conf" || true
+  # hyprlock.conf sources the generated background file (`hyprdeb apply` writes it); without one hyprlock reports a config error.
+  if [ ! -e "$CONF_DIR/hyprdeb-lock.conf" ]; then
+    run cp "$REPO/config/hyprdeb/hyprdeb-lock.default.conf" "$CONF_DIR/hyprdeb-lock.conf"
+  fi
   for f in hypridle hyprpaper; do
     if deploy_file "$src/$f.conf" "$CONF_DIR/$f.conf"; then restart_app "$f"; fi
   done
@@ -984,7 +1067,7 @@ stage_settings() {
   # still create it with the default listeners, so the idle lock never silently disappears.
   # Same for the wallpaper block that hyprpaper.conf sources.
   local f
-  for f in idle paper; do
+  for f in idle paper lock; do
     if [ ! -e "$CONF_DIR/hyprdeb-$f.conf" ]; then
       run cp "$REPO/config/hyprdeb/hyprdeb-$f.default.conf" "$CONF_DIR/hyprdeb-$f.conf"
       [ "$DRY" = 1 ] || warn "$CONF_DIR/hyprdeb-$f.conf was missing and apply did not create it: wrote the defaults"
@@ -1036,6 +1119,7 @@ networkmanager|stage_networkmanager|yes|--networkmanager|wired uplink from ifupd
 networkmanager-rollback|stage_networkmanager_rollback|yes|--networkmanager-rollback|undo the switch: ifupdown/dhcpcd again, NetworkManager disabled
 nas|stage_nas|yes|--nas|NAS shares from [nas.NAME] in settings.toml + the root helper behind the NAS page (asks for new passwords)
 printing|stage_printing|yes|--printing|CUPS and the printer queue from [printing] in settings.toml (driverless IPP, a PPD of yours, or the Canon LBP6030 driver)
+virt|stage_virt|yes|--virt|libvirt + virt-manager, the default NAT network, libvirt group, VMs shut down (not suspended) at host shutdown (see docs/virt.md)
 greeter|stage_greeter|yes|--greeter|greetd + tuigreet login screen (read docs/recovery.md first)'
 STAGE_GROUPS='packages=base,desktop,shell,apps
 user=config,settings,notifications,icons,waybar,lock,kitty,xdg-dirs,swappy,defaultapps'
@@ -1082,13 +1166,13 @@ select_stages() {
     case "$n" in
       chrome) [ "$NO_CHROME_GIVEN" = 0 ] || die "--only chrome contradicts --no-chrome"; CHROME=1 ;;
       nvidia) NVIDIA=1 ;; vscode) VSCODE=1 ;; cowork) COWORK=1 ;; flatpak) FLATPAK=1 ;; virtualcam) VIRTUALCAM=1 ;;
-      nas) NAS=1 ;; printing) PRINTING=1 ;; greeter) GREETER=1 ;; networkmanager) NETWORKMANAGER=1 ;; networkmanager-rollback) NM_ROLLBACK=1 ;;
+      nas) NAS=1 ;; printing) PRINTING=1 ;; virt) VIRT=1 ;; greeter) GREETER=1 ;; networkmanager) NETWORKMANAGER=1 ;; networkmanager-rollback) NM_ROLLBACK=1 ;;
       timezone) [ -n "$TZ_WANT" ] || die "--only timezone needs --timezone VALUE" ;;
     esac
   done
   [ "$NETWORKMANAGER" = 0 ] || [ "$NM_ROLLBACK" = 0 ] || die "--networkmanager and --networkmanager-rollback contradict each other"
   # Flags of stages that are not selected would silently do nothing: say so.
-  for flag in "nvidia:$NVIDIA" "vscode:$VSCODE" "cowork:$COWORK" "flatpak:$FLATPAK" "virtualcam:$VIRTUALCAM" "nas:$NAS" "printing:$PRINTING" "greeter:$GREETER" "networkmanager:$NETWORKMANAGER" "networkmanager-rollback:$NM_ROLLBACK"; do
+  for flag in "nvidia:$NVIDIA" "vscode:$VSCODE" "cowork:$COWORK" "flatpak:$FLATPAK" "virtualcam:$VIRTUALCAM" "nas:$NAS" "printing:$PRINTING" "virt:$VIRT" "greeter:$GREETER" "networkmanager:$NETWORKMANAGER" "networkmanager-rollback:$NM_ROLLBACK"; do
     if [ "${flag#*:}" = 1 ] && ! stage_selected "${flag%%:*}"; then warn "--${flag%%:*} has no effect: the stage is not selected by --only"; fi
   done
   if [ -n "$TZ_WANT" ] && ! stage_selected timezone; then warn "--timezone has no effect: the stage is not selected by --only"; fi

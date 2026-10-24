@@ -46,7 +46,7 @@ CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
 DEFAULT_SETTINGS = os.path.join(CONFIG_HOME, "hyprdeb", "settings.toml")
 # Fixed to ~/.config/hypr: config/hypr/settings.lua, hypridle.conf and hyprpaper.conf load exactly these names.
 DEFAULT_OUT = os.path.join(HOME, ".config", "hypr", "hyprdeb-settings.lua")
-IDLE_NAME, PAPER_NAME = "hyprdeb-idle.conf", "hyprdeb-paper.conf"
+IDLE_NAME, PAPER_NAME, LOCK_NAME = "hyprdeb-idle.conf", "hyprdeb-paper.conf", "hyprdeb-lock.conf"
 SETTINGS_FRIENDLY = "~/.config/hyprdeb/settings.toml"
 XKB_LST = "/usr/share/X11/xkb/rules/evdev.lst"
 
@@ -56,7 +56,7 @@ DURATION_RE = re.compile(r"^(\d+)([smh])$")
 MONITOR_KEYS = {"match", "mode", "position", "scale", "disabled"}
 SECTION_KEYS = {
     "idle": {"lock_after", "screen_off_after"},
-    "wallpaper": {"path", "fit"},
+    "wallpaper": {"path", "fit", "interval", "order", "lock", "lock_blur", "monitor"},
     "keyboard": {"layouts", "variants", "toggle", "repeat_rate", "repeat_delay", "numlock"},
     "mouse": {"speed", "acceleration", "natural_scroll", "scroll_speed", "left_handed", "focus_follows"},
     "notifications": {"timeout", "opacity", "font", "dnd"},
@@ -73,6 +73,15 @@ NETWORK_KEYS = ("network.lan_dns_name", "network.internet_check", "network.ipv4_
 VPN_KEYS = ("vpn.default", "vpn.keep_lan_dns")
 PRINTING_KEYS = ("printing.printer_name", "printing.printer_uri", "printing.default", "printing.driver", "printing.ppd")
 FITS = ("cover", "contain", "tile", "fill")  # `man hyprpaper` (0.8.4): "One of contain, cover, tile, or fill"
+# Formats hyprpaper 0.8.4 really loads (tested on the PC with one image of each: png jpg webp jxl bmp load; tiff and gif fail,
+# avif/heic could not be tested). hyprlock links the same libhyprgraphics, so the lock screen uses the same list.
+WALLPAPER_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".jxl", ".bmp")
+# Image types that hyprpaper tries in a slideshow folder (it picks files by content, not by extension) and fails to load.
+UNLOADABLE_EXTS = (".gif", ".tif", ".tiff", ".avif", ".heic", ".heif", ".svg", ".ico", ".jp2")
+WALLPAPER_ORDERS = ("random",)   # without `order` hyprpaper uses the raw directory order (not sorted by name): random is the only useful value
+WALLPAPER_MONITOR_KEYS = {"match", "path", "fit", "interval"}
+INTERVAL_MIN_S, INTERVAL_MAX_S = 10, 86400
+LOCK_BLUR_MAX = 4
 TOGGLES = {"caps": "grp:caps_toggle", "alt_shift": "grp:alt_shift_toggle", "win_space": "grp:win_space_toggle"}
 # hyprdeb-lock switches to layout 0 before locking, and a password typed in a non-Latin layout is refused, so the
 # first layout must be Latin. This cannot be derived from evdev.lst offline, so it is a conservative allowlist.
@@ -173,7 +182,7 @@ ICONS = {
     "window": ("app-window", "efe6"), "workspace": ("layout-grid", "edba"), "apps": ("apps", "ebb6"),
     "clipboard": ("clipboard", "ea6f"), "camera": ("camera", "ea54"), "other": ("dots", "ea95"), "search": ("search", "eb1c"), "command": ("command", "ea78"), "printer": ("printer", "eb0e"),
 }
-SECTION_ICONS = {"idle": "clock", "wallpaper": "wallpaper", "mouse": "mouse", "keyboard": "keyboard",
+SECTION_ICONS = {"lock": "lock", "idle": "clock", "wallpaper": "wallpaper", "mouse": "mouse", "keyboard": "keyboard",
                  "notifications": "bell", "fonts": "font", "monitors": "monitor", "nas": "nas", "network": "network", "vpn": "vpn", "shortcuts": "command", "printers": "printer"}
 
 DEFAULTS = {
@@ -181,6 +190,10 @@ DEFAULTS = {
     "idle.screen_off_after": "15m",
     "wallpaper.path": "~/.config/hypr/wallpaper.png",
     "wallpaper.fit": "cover",
+    "wallpaper.interval": "30m",
+    "wallpaper.order": "random",
+    "wallpaper.lock": "same",
+    "wallpaper.lock_blur": 2,
     "keyboard.layouts": ["us"],
     "keyboard.variants": [""],
     "keyboard.toggle": "caps",
@@ -188,7 +201,8 @@ DEFAULTS = {
 # Type of each settable key, for parsing command-line values.
 KEY_TYPES = {
     "idle.lock_after": "str", "idle.screen_off_after": "str",
-    "wallpaper.path": "str", "wallpaper.fit": "str",
+    "wallpaper.path": "str", "wallpaper.fit": "str", "wallpaper.interval": "str", "wallpaper.order": "str",
+    "wallpaper.lock": "str", "wallpaper.lock_blur": "int",
     "keyboard.layouts": "list", "keyboard.variants": "list", "keyboard.toggle": "str",
     **{k: t for k, (_, t) in INPUT_KEYS.items()},
     "notifications.timeout": "str", "notifications.opacity": "float", "notifications.font": "str",
@@ -641,6 +655,127 @@ def validate_network(data):
     return out
 
 
+def parse_interval(v, where):
+    """'30s' / '15m' / '1h' -> seconds, 10 s to 24 h."""
+    m = DURATION_RE.match(v) if isinstance(v, str) else None
+    secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)] if m else None
+    if secs is None or not INTERVAL_MIN_S <= secs <= INTERVAL_MAX_S:
+        raise SettingsError(f"{where}: must be a duration from 10s to 24h like \"30s\", \"15m\", \"1h\", got {v!r}")
+    return secs
+
+
+def is_wallpaper_image(name):
+    return name.lower().endswith(WALLPAPER_EXTS)
+
+
+def folder_images(real):
+    """Sorted names of the images directly inside a folder (hyprpaper does not read subfolders unless `recursive` is set,
+    which hyprdeb never sets)."""
+    return sorted((n for n in os.listdir(real) if is_wallpaper_image(n) and os.path.isfile(os.path.join(real, n))), key=lambda n: (n.lower(), n))
+
+
+def check_paper_path(path, where):
+    """A wallpaper path from settings.toml -> (absolute path, "file" | "dir", warnings). SettingsError when unusable."""
+    if not isinstance(path, str) or not path.strip():
+        raise SettingsError(f"{where} path must be a non-empty string, got {path!r}")
+    real = os.path.expanduser(path)
+    if not os.path.isabs(real):
+        raise SettingsError(f"{where} path must be absolute or start with ~, got {path!r}")
+    # The path is written unquoted into hyprdeb-paper.conf, where hyprlang reads '#' as a comment and '$' as a variable.
+    for ch, what in (("#", "'#' (it starts a comment in hyprlang)"), ("$", "'$' (it starts a variable in hyprlang)"),
+                     ("\n", "a newline"), ("\r", "a newline")):
+        if ch in real:
+            raise SettingsError(f"{where} path must not contain {what}: {path!r}")
+    exts = ", ".join(e[1:] for e in WALLPAPER_EXTS)
+    if os.path.isdir(real):
+        if not os.access(real, os.R_OK | os.X_OK):
+            raise SettingsError(f"{where} path {real}: the folder is not readable")
+        names = folder_images(real)
+        if not names:
+            raise SettingsError(f"{where} path {real}: the folder has no image ({exts}); subfolders are not read")
+        bad = sorted(n for n in os.listdir(real) if n.lower().endswith(UNLOADABLE_EXTS) and os.path.isfile(os.path.join(real, n)))
+        warns = [f"{where} folder {real}: hyprpaper cannot load {n} (formats: {exts}); it fails when that file comes up" for n in bad]
+        return real, "dir", warns
+    if not os.path.isfile(real) or not os.access(real, os.R_OK):
+        raise SettingsError(f"{where} path {real}: not a readable image file or folder")
+    if not is_wallpaper_image(real):
+        raise SettingsError(f"{where} path {real}: hyprpaper loads only {exts}")
+    return real, "file", []
+
+
+def validate_wallpaper(data):
+    """[wallpaper]: path (file or slideshow folder), fit, interval, order, lock, lock_blur, plus [[wallpaper.monitor]] overrides.
+    Returns the all-monitors target ("path", "fit", "kind", "interval", "interval_s"), "monitors" (each override merged over
+    it), "lock", "lock_blur", "order" and "warnings"."""
+    wp = data.get("wallpaper", {})
+    warnings = []
+    fit = wp.get("fit", DEFAULTS["wallpaper.fit"])
+    if not isinstance(fit, str) or fit not in FITS:
+        raise SettingsError(f"[wallpaper] fit must be one of {', '.join(FITS)}, got {fit!r}")
+    interval = wp.get("interval", DEFAULTS["wallpaper.interval"])
+    interval_s = parse_interval(interval, "[wallpaper] interval")
+    order = wp.get("order", DEFAULTS["wallpaper.order"])
+    if order not in WALLPAPER_ORDERS:
+        raise SettingsError(f"[wallpaper] order must be {' or '.join(WALLPAPER_ORDERS)} (the only order hyprpaper supports), got {order!r}")
+    path = wp.get("path")
+    if path is None:
+        base = {"path": DEFAULTS["wallpaper.path"], "kind": "file", "explicit": False}
+    else:
+        real, kind, w = check_paper_path(path, "[wallpaper]")
+        warnings += w
+        base = {"path": real, "kind": kind, "explicit": True}
+    base.update(fit=fit, interval=interval, interval_s=interval_s)
+    lock = wp.get("lock", DEFAULTS["wallpaper.lock"])
+    if not isinstance(lock, str) or not lock.strip():
+        raise SettingsError(f"[wallpaper] lock must be \"same\", \"default\" or an image file, got {lock!r}")
+    if lock not in ("same", "default"):
+        real = os.path.expanduser(lock)
+        if not os.path.isabs(real) or any(c in real for c in "#$\r\n"):
+            raise SettingsError(f"[wallpaper] lock must be \"same\", \"default\" or an absolute image path without '#' or '$', got {lock!r}")
+        if not os.path.isfile(real) or not os.access(real, os.R_OK) or not is_wallpaper_image(real):
+            raise SettingsError(f"[wallpaper] lock {real}: not a readable image file ({', '.join(e[1:] for e in WALLPAPER_EXTS)})")
+        lock = real
+    blur = wp.get("lock_blur", DEFAULTS["wallpaper.lock_blur"])
+    if isinstance(blur, bool) or not isinstance(blur, int) or not 0 <= blur <= LOCK_BLUR_MAX:
+        raise SettingsError(f"[wallpaper] lock_blur must be a whole number from 0 to {LOCK_BLUR_MAX}, got {blur!r}")
+    raw = wp.get("monitor", [])
+    if not isinstance(raw, list) or not all(isinstance(m, dict) for m in raw):
+        raise SettingsError("[wallpaper] monitor must be an array of tables ([[wallpaper.monitor]])")
+    mons, seen = [], set()
+    for i, m in enumerate(raw, 1):
+        where = f"[[wallpaper.monitor]] #{i}"
+        bad = set(m) - WALLPAPER_MONITOR_KEYS
+        if bad:
+            raise SettingsError(f"{where}: unknown key(s): {', '.join(sorted(bad))} (allowed: {', '.join(sorted(WALLPAPER_MONITOR_KEYS))})")
+        match = m.get("match")
+        if not isinstance(match, str) or not match.strip() or match != match.strip():
+            raise SettingsError(f"{where}: 'match' is required: \"desc:<description>\" or an output name like DP-1")
+        if match in seen:
+            raise SettingsError(f"{where}: 'match' {match!r} appears twice")
+        seen.add(match)
+        if match.startswith("desc:"):
+            if not match[5:].strip():
+                raise SettingsError(f"{where}: 'desc:' needs a description")
+            if any(c in match for c in "#$\r\n"):
+                raise SettingsError(f"{where}: 'match' must not contain '#' or '$' (hyprlang special characters): {match!r}")
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]+", match):
+            raise SettingsError(f"{where}: 'match' must be 'desc:<description>' or an output name like DP-1, got {match!r}")
+        t = dict(base, match=match, overridden=sorted(k for k in m if k != "match"))
+        if "fit" in m:
+            if not isinstance(m["fit"], str) or m["fit"] not in FITS:
+                raise SettingsError(f"{where}: fit must be one of {', '.join(FITS)}, got {m['fit']!r}")
+            t["fit"] = m["fit"]
+        if "interval" in m:
+            t["interval_s"] = parse_interval(m["interval"], f"{where}: interval")
+            t["interval"] = m["interval"]
+        if "path" in m:
+            t["path"], t["kind"], w = check_paper_path(m["path"], where)
+            t["explicit"] = True
+            warnings += w
+        mons.append(t)
+    return {**base, "order": order, "lock": lock, "lock_blur": blur, "monitors": mons, "warnings": warnings}
+
+
 def validate(data):
     """Return the validated settings dict, or raise SettingsError.
 
@@ -707,27 +842,7 @@ def validate(data):
                             "when both are on")
     idle_v = {"lock_after": lock_raw, "screen_off_after": off_raw, "lock_s": lock, "screen_off_s": off}
 
-    wp = data.get("wallpaper", {})
-    fit = wp.get("fit", DEFAULTS["wallpaper.fit"])
-    if not isinstance(fit, str) or fit not in FITS:
-        raise SettingsError(f"[wallpaper] fit must be one of {', '.join(FITS)}, got {fit!r}")
-    path = wp.get("path")
-    if path is None:
-        wall = {"path": DEFAULTS["wallpaper.path"], "fit": fit, "explicit": False}
-    else:
-        if not isinstance(path, str) or not path.strip():
-            raise SettingsError(f"[wallpaper] path must be a non-empty string, got {path!r}")
-        real = os.path.expanduser(path)
-        if not os.path.isabs(real):
-            raise SettingsError(f"[wallpaper] path must be absolute or start with ~, got {path!r}")
-        # The path is written unquoted into hyprdeb-paper.conf, where hyprlang reads '#' as a comment and '$' as a variable.
-        for ch, what in (("#", "'#' (it starts a comment in hyprlang)"), ("$", "'$' (it starts a variable in hyprlang)"),
-                         ("\n", "a newline"), ("\r", "a newline")):
-            if ch in real:
-                raise SettingsError(f"[wallpaper] path must not contain {what}: {path!r}")
-        if not os.path.isfile(real) or not os.access(real, os.R_OK):
-            raise SettingsError(f"[wallpaper] path {real}: not a readable image file")
-        wall = {"path": real, "fit": fit, "explicit": True}
+    wall = validate_wallpaper(data)
 
     fonts = validate_fonts(data)
     kb = {k: v for k, v in data.get("keyboard", {}).items() if k in ("layouts", "variants", "toggle")}
@@ -800,19 +915,86 @@ def generate_idle(st):
     return "\n".join(lines) + "\n"
 
 
+def paper_block(monitor, t):
+    lines = ["wallpaper {", (f"    monitor = {monitor}").rstrip(), f"    path = {t['path']}", f"    fit_mode = {t['fit']}"]
+    if t["kind"] == "dir":     # a folder is a slideshow; without `order` hyprpaper would use the raw directory order
+        lines += [f"    timeout = {t['interval_s']}", f"    order = {t['order']}"]
+    return lines + ["}"]
+
+
 def generate_paper(st):
     w = st["wallpaper"]
     lines = [
         "# hyprdeb managed: generated by `hyprdeb apply` from " + SETTINGS_FRIENDLY + ". Do not edit; changes are overwritten.",
         "# Sourced by hyprpaper.conf. Empty monitor = fallback for every monitor without its own block.",
         "",
-        "wallpaper {",
-        "    monitor =",
-        f"    path = {w['path']}",
-        f"    fit_mode = {w['fit']}",
-        "}",
     ]
+    for m in w["monitors"]:
+        lines += paper_block(m["match"], dict(m, order=w["order"])) + [""]
+    lines += paper_block("", dict(w))
     return "\n".join(lines) + "\n"
+
+
+LOCK_EXTS = WALLPAPER_EXTS   # formats given to hyprlock; narrow this if a format turns out not to load there
+
+
+def lock_image(t):
+    """(path for hyprlock, None) for a wallpaper target, or (None, reason): a file as it is, a slideshow folder = its first image
+    by name (stable: the lock screen must not change between two locks)."""
+    path = t["path"]
+    if t["kind"] == "dir":
+        names = [n for n in folder_images(path) if n.lower().endswith(LOCK_EXTS) and not any(c in n for c in "#$")]
+        if not names:
+            return None, f"no image in {path} that the lock screen can use"
+        return os.path.join(path, names[0]), None
+    if not path.lower().endswith(LOCK_EXTS):
+        return None, f"the lock screen cannot load {os.path.basename(path)}"
+    return path, None
+
+
+def lock_plan(st):
+    """([(monitor, image, zindex or None)], warnings) for hyprdeb-lock.conf. A failed load would leave a plain colour, so an image
+    the lock screen is not known to load is replaced by the shipped default (with a warning)."""
+    w = st["wallpaper"]
+    default = DEFAULTS["wallpaper.path"]
+    if w["lock"] == "default":
+        return [("", default, None)], []
+    if w["lock"] != "same":
+        return [("", w["lock"], None)], []
+    warns, blocks = [], []
+    targets = [("", w)] + [(m["match"], m) for m in w["monitors"]]
+    for mon, t in targets:
+        img, why = lock_image(t) if t["explicit"] else (t["path"], None)
+        if img is None:
+            warns.append(f"lock screen{' on ' + mon if mon else ''}: {why}; using the default image")
+            img = default
+        blocks.append((mon, img, (-2 if mon == "" else -1) if w["monitors"] else None))
+    # fallback first (lowest zindex), then the monitors with their own wallpaper on top
+    return blocks, warns
+
+
+def generate_lock(st):
+    blocks, _ = lock_plan(st)
+    blur = st["wallpaper"]["lock_blur"]
+    lines = [
+        "# hyprdeb managed: generated by `hyprdeb apply` from " + SETTINGS_FRIENDLY + ". Do not edit; changes are overwritten.",
+        "# Sourced by hyprlock.conf. Empty monitor = every monitor; a block with a monitor is drawn over it (higher zindex).",
+    ]
+    for mon, img, z in blocks:
+        lines += ["", "background {", (f"    monitor = {mon}").rstrip(), f"    path = {img}", f"    blur_passes = {blur}"]
+        if z is not None:
+            lines.append(f"    zindex = {z}")
+        lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def wallpaper_warnings(st):
+    return st["wallpaper"]["warnings"] + lock_plan(st)[1]
+
+
+def warn_wallpaper(st):
+    for w in wallpaper_warnings(st):
+        print(f"warning: {w}", file=sys.stderr)
 
 
 def generate_mako(st):
@@ -869,6 +1051,7 @@ def build_outputs(st, outdir, lua_path):
     return {lua_path: generate_lua(st),
             os.path.join(outdir, IDLE_NAME): generate_idle(st),
             os.path.join(outdir, PAPER_NAME): generate_paper(st),
+            os.path.join(outdir, LOCK_NAME): generate_lock(st),
             mako: generate_mako(st),
             fontconf: generate_fontconf(st)}
 
@@ -909,7 +1092,7 @@ def hyprctl(*a):
     return (r.stdout + r.stderr).strip()
 
 
-def unmatched_warnings(monitors):
+def unmatched_warnings(monitors, wallpaper_monitors=()):
     """Rules that match no known output (not an error): a typo, or the monitor is unplugged."""
     try:
         known = json.loads(hyprctl("monitors", "all", "-j"))
@@ -917,12 +1100,21 @@ def unmatched_warnings(monitors):
         return ["could not read 'hyprctl monitors all -j'; rule matching not checked"]
     names = {m.get("name") for m in known}
     descs = {"desc:" + m.get("description", "") for m in known}
-    return [f"monitor rule {m['match']!r} matches no known output (typo, or not connected); see 'hyprctl monitors all'"
-            for m in monitors if m["match"] not in names and m["match"] not in descs]
+    return ([f"monitor rule {m['match']!r} matches no known output (typo, or not connected); see 'hyprctl monitors all'"
+             for m in monitors if m["match"] not in names and m["match"] not in descs]
+            + [f"wallpaper for {m['match']!r}: matches no connected output (typo, or not connected); it is kept and used when that monitor is back"
+               for m in wallpaper_monitors if not monitor_connected(m["match"], names, known)])
 
 
-def warn_unmatched(monitors):
-    for w in unmatched_warnings(monitors):
+def monitor_connected(match, names, known):
+    """Same matching as hyprpaper and hyprlock: an output name, or "desc:" followed by the start of the description."""
+    if match in names:
+        return True
+    return match.startswith("desc:") and any(m.get("description", "").startswith(match[5:]) for m in known)
+
+
+def warn_unmatched(monitors, wallpaper_monitors=()):
+    for w in unmatched_warnings(monitors, wallpaper_monitors):
         print(f"warning: {w}", file=sys.stderr)
 
 
@@ -1119,7 +1311,7 @@ def apply_outputs(st, outputs, dry_run, live=True):
         for p in outputs:
             print(f"{p} is up to date")
         if live and in_hyprland():
-            warn_unmatched(st["monitors"])
+            warn_unmatched(st["monitors"], st["wallpaper"]["monitors"])
         if live and not dry_run:
             msg = sync_dnd(st["notifications"]["dnd"])
             if msg:
@@ -1167,7 +1359,7 @@ def apply_outputs(st, outputs, dry_run, live=True):
         print("hyprctl reload:", hyprctl("reload"))
         after = hyprctl("configerrors").splitlines()
         new = [l for l in after if l.strip() and l not in before]
-        warn_unmatched(st["monitors"])
+        warn_unmatched(st["monitors"], st["wallpaper"]["monitors"])
         if new:
             print("Hyprland reports new config errors after the reload:\n" + "\n".join(new), file=sys.stderr)
             rc = 1
@@ -1199,14 +1391,16 @@ def cmd_check(args):
         print(f"### {p}")
         sys.stdout.write(t)
     print("settings OK", file=sys.stderr)
+    warn_wallpaper(st)
     warn_idle_missing(os.path.dirname(args.out or DEFAULT_OUT))
     if args.out is None and in_hyprland():
-        warn_unmatched(st["monitors"])
+        warn_unmatched(st["monitors"], st["wallpaper"]["monitors"])
     return 0
 
 
 def cmd_apply(args):
     st, outputs = plan(args)
+    warn_wallpaper(st)
     return apply_outputs(st, outputs, args.dry_run, live=args.out is None)
 
 
@@ -1219,6 +1413,10 @@ def effective(st):
         "idle.screen_off_after": st["idle"]["screen_off_after"],
         "wallpaper.path": st["wallpaper"]["path"],
         "wallpaper.fit": st["wallpaper"]["fit"],
+        "wallpaper.interval": st["wallpaper"]["interval"],
+        "wallpaper.order": st["wallpaper"]["order"],
+        "wallpaper.lock": st["wallpaper"]["lock"],
+        "wallpaper.lock_blur": st["wallpaper"]["lock_blur"],
         "keyboard.layouts": kb["layouts"],
         "keyboard.variants": kb["variants"],
         "keyboard.toggle": kb["toggle"],
@@ -1285,6 +1483,37 @@ def preset_choices(current, presets=None):
     return list(presets) + ([current] if current not in presets else [])
 
 
+WALLPAPER_INTERVALS = ("5m", "15m", "30m", "1h", "3h")
+
+
+def wallpaper_targets(st):
+    """What the Wallpaper page edits: "All monitors" first, then each connected monitor (by its description), then saved
+    overrides whose monitor is not connected (so they can still be edited or removed). Each: label, match ("" = all), the
+    effective path / fit / interval / kind, whether it has its own settings, and which keys are its own."""
+    w = st["wallpaper"]
+    def row(label, match, t, connected, own):
+        return {"label": label, "match": match, "path": t["path"], "file": os.path.expanduser(t["path"]), "kind": t["kind"],
+                "fit": t["fit"], "interval": t["interval"], "connected": connected, "own": own is not None,
+                "overridden": t.get("overridden", []) if own is not None else []}
+    rows = [row("All monitors", "", w, True, None)]
+    own_left = {m["match"]: m for m in w["monitors"]}
+    known = []
+    if in_hyprland():
+        try:
+            known = json.loads(hyprctl("monitors", "all", "-j"))
+        except (ValueError, subprocess.SubprocessError, OSError):
+            known = []
+    for mon in known:
+        name, desc = mon.get("name", ""), mon.get("description", "")
+        hit = next((k for k in own_left if k == name or (k.startswith("desc:") and desc.startswith(k[5:]))), None)
+        t = own_left.pop(hit) if hit else w
+        label = f"{desc} ({name})" if desc else name
+        rows.append(row(label, hit or ("desc:" + desc if desc else name), t, True, t if hit else None))
+    for k, t in own_left.items():
+        rows.append(row(f"{k[5:] if k.startswith('desc:') else k} (not connected)", k, t, False, t))
+    return rows
+
+
 def show_json(args):
     """`show --json`: everything the settings window needs, so it needs no logic of its own. Always valid JSON; if
     settings.toml is invalid: {"ok": false, "error": ...} and exit status 1."""
@@ -1296,7 +1525,8 @@ def show_json(args):
     eff = effective(st)
     warnings = idle_missing_warnings(os.path.dirname(DEFAULT_OUT))
     if in_hyprland():
-        warnings += unmatched_warnings(st["monitors"])
+        warnings += unmatched_warnings(st["monitors"], st["wallpaper"]["monitors"])
+    warnings += wallpaper_warnings(st)
     d, names = wallpaper_candidates()
     cur = os.path.expanduser(eff["wallpaper.path"])
     default = os.path.expanduser(DEFAULTS["wallpaper.path"])
@@ -1326,11 +1556,14 @@ def show_json(args):
             "idle.lock_after": preset_choices(eff["idle.lock_after"]),
             "idle.screen_off_after": preset_choices(eff["idle.screen_off_after"]),
             "wallpaper.fit": list(FITS),
+            "wallpaper.interval": preset_choices(eff["wallpaper.interval"], WALLPAPER_INTERVALS),
             "keyboard.toggle": list(TOGGLES),
             "notifications.timeout": preset_choices(eff["notifications.timeout"], NOTIF_TIMEOUTS),
             "fonts.persian": persian_choices(eff["fonts.persian"]),
         },
-        "wallpaper": {"folder": d, "candidates": cands},
+        "wallpaper": {"folder": d, "candidates": cands, "targets": wallpaper_targets(st),
+                      "extensions": list(WALLPAPER_EXTS), "interval": {"min": INTERVAL_MIN_S, "max": INTERVAL_MAX_S},
+                      "interval_presets": list(WALLPAPER_INTERVALS), "lock_blur_max": LOCK_BLUR_MAX},
         "monitors": st["monitors"],
         "monitors_hint": f"edit {SETTINGS_FRIENDLY}, then run: hyprdeb apply",
         "warnings": warnings,
@@ -1396,6 +1629,99 @@ def parse_cli_value(key, raw):
     return raw
 
 
+def wallpaper_monitor_edit(args, op, match, fields):
+    """Add / change / remove one [[wallpaper.monitor]] with tomlkit (comments kept), validate the whole new document, write it
+    (settings.toml.bak the first time), then apply like `set`."""
+    try:
+        import tomlkit
+    except ImportError:
+        raise SettingsError("this needs python3-tomlkit (sudo apt install python3-tomlkit); settings.toml was not touched")
+    path = args.settings or DEFAULT_SETTINGS
+    old_text = read_or_none(path)
+    doc = tomlkit.parse(old_text or "")
+    if "wallpaper" not in doc:
+        if op != "set":
+            print(f"no wallpaper settings for {match} (nothing to remove)")
+            return 0
+        doc["wallpaper"] = tomlkit.table()
+    wall = doc["wallpaper"]
+    arr = wall.get("monitor")
+    entry = next((t for t in arr if t.get("match") == match), None) if arr is not None else None
+    if op == "set":
+        if entry is None:
+            if arr is None:
+                wall["monitor"] = tomlkit.aot()
+                arr = wall["monitor"]
+            entry = tomlkit.table()
+            entry["match"] = match
+            for k, v in fields.items():
+                entry[k] = v
+            entry.add(tomlkit.nl())       # a blank line before the next table
+            arr.append(entry)
+            fields = {}
+        for k, v in fields.items():
+            entry[k] = v
+    elif entry is not None:
+        arr.remove(entry)
+        if len(arr) == 0:
+            del wall["monitor"]
+        if len(wall) == 0:
+            del doc["wallpaper"]
+    elif op == "clear":
+        print(f"no wallpaper settings for {match} (nothing to remove)")
+    new_text = tomlkit.dumps(doc)
+    try:
+        st = validate(tomllib.loads(new_text))
+    except tomllib.TOMLDecodeError as e:
+        raise SettingsError(f"internal error: new document is not valid TOML: {e}")
+    lua_path = args.out or DEFAULT_OUT
+    outputs = build_outputs(st, os.path.dirname(lua_path), lua_path)
+    warn_wallpaper(st)
+    if args.dry_run:
+        sys.stdout.write(diff_text(old_text, new_text, path))
+        apply_outputs(st, outputs, True, live=args.out is None)
+        return 0
+    if new_text != (old_text or ""):
+        bak = path + ".bak"
+        if old_text is not None and not os.path.exists(bak):
+            write_atomic(bak, old_text)
+            print(f"{bak} written (first change by hyprdeb)")
+        write_atomic(path, new_text)
+        print(f"{path} updated")
+    else:
+        print(f"{path} unchanged")
+    return apply_outputs(st, outputs, False, live=args.out is None)
+
+
+def cmd_wallpaper(args):
+    """hyprdeb wallpaper pick file|folder | monitor set MATCH [--path P] [--fit F] [--interval I] | monitor clear MATCH. Never uses the
+    hyprpaper IPC (`hyprctl hyprpaper`): in 0.8.4 it hangs and kills hyprpaper. Changes are applied by `apply`, which restarts hyprpaper."""
+    if args.action == "pick":
+        exts = [e for x in WALLPAPER_EXTS for e in ("*" + x, "*" + x.upper(), "*" + x.capitalize())]
+        start = wallpaper_candidates()[0]
+        try:
+            if args.kind == "folder":
+                path = portal_pick("Choose a wallpaper folder", directory=True, start=start)
+            else:
+                path = portal_pick("Choose a wallpaper", [("Images (" + ", ".join(x[1:] for x in WALLPAPER_EXTS) + ")", exts)], start=start)
+        except VpnError as e:
+            print(f"hyprdeb: error: {e}", file=sys.stderr)
+            return VPN_EXIT["error"]
+        if path is None:
+            return VPN_EXIT["cancelled"]
+        print(path)
+        return 0
+    match = args.match
+    if args.op == "clear":
+        return wallpaper_monitor_edit(args, "clear", match, {})
+    fields = {}
+    for k in ("path", "fit", "interval"):
+        v = getattr(args, k)
+        if v is not None:
+            fields[k] = v
+    return wallpaper_monitor_edit(args, "set", match, fields)
+
+
 def cmd_set(args):
     pairs = args.pairs
     if len(pairs) % 2:
@@ -1430,6 +1756,7 @@ def cmd_set(args):
         raise SettingsError(f"internal error: new document is not valid TOML: {e}")
     lua_path = args.out or DEFAULT_OUT
     outputs = build_outputs(st, os.path.dirname(lua_path), lua_path)
+    warn_wallpaper(st)
     if args.dry_run:
         sys.stdout.write(diff_text(old_text, new_text, path))
         apply_outputs(st, outputs, True, live=args.out is None)
@@ -2661,14 +2988,16 @@ def vpn_import(args):
     return 0
 
 
-def vpn_pick_file():
-    """Ask the desktop portal (GTK file chooser) for a .conf file; print only the chosen path. Exit 0 chosen, 5 cancelled, 3 unavailable."""
+def portal_pick(title, filters=None, directory=False, start=None):
+    """Ask the desktop portal (GTK file chooser) for a file (a filter is (name, [globs]); no filter = every file) or a folder.
+    Returns the chosen path, or None when cancelled. VpnError (exit 3) when no chooser is available. Shared by `vpn pick-file`
+    and `wallpaper pick`."""
     try:
         import gi
         gi.require_version("Gio", "2.0")
         from gi.repository import Gio, GLib
     except (ImportError, ValueError):
-        raise VpnError("no file chooser: python3-gi is not installed (paste the text instead)")
+        raise VpnError("no file chooser: python3-gi is not installed")
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     except GLib.Error as e:
@@ -2686,23 +3015,39 @@ def vpn_pick_file():
 
     sub = bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", request, None,
                                Gio.DBusSignalFlags.NONE, on_response)
-    filters = GLib.Variant("a(sa(us))", [("WireGuard configuration (*.conf)", [(0, "*.conf")]), ("All files", [(0, "*")])])
-    opts = {"handle_token": GLib.Variant("s", token), "filters": filters, "modal": GLib.Variant("b", True)}
+    opts = {"handle_token": GLib.Variant("s", token), "modal": GLib.Variant("b", True)}
+    if directory:
+        opts["directory"] = GLib.Variant("b", True)
+    elif filters:
+        opts["filters"] = GLib.Variant("a(sa(us))", [(name, [(0, g) for g in globs]) for name, globs in filters])
+    if start and os.path.isdir(start):
+        opts["current_folder"] = GLib.Variant("ay", os.fsencode(start) + b"\0")
     try:
         bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser", "OpenFile",
-                      GLib.Variant("(ssa{sv})", ("", "Choose a WireGuard configuration", opts)), None, Gio.DBusCallFlags.NONE, 5000, None)
+                      GLib.Variant("(ssa{sv})", ("", title, opts)), None, Gio.DBusCallFlags.NONE, 5000, None)
     except GLib.Error:
         bus.signal_unsubscribe(sub)
-        raise VpnError("no file chooser: the desktop portal did not answer (paste the text instead)")
+        raise VpnError("no file chooser: the desktop portal did not answer")
     GLib.timeout_add_seconds(600, loop.quit)
     loop.run()
     bus.signal_unsubscribe(sub)
     if out.get("code") != 0 or not out.get("uris"):
-        return VPN_EXIT["cancelled"]
+        return None
     uri = out["uris"][0]
     if not uri.startswith("file://"):
-        raise VpnError("the chosen file is not a local file")
-    print(urllib.parse.unquote(uri[len("file://"):]))
+        raise VpnError("the chosen item is not a local file")
+    return urllib.parse.unquote(uri[len("file://"):])
+
+
+def vpn_pick_file():
+    """Ask the desktop portal for a .conf file; print only the chosen path. Exit 0 chosen, 5 cancelled, 3 unavailable."""
+    try:
+        path = portal_pick("Choose a WireGuard configuration", [("WireGuard configuration (*.conf)", ["*.conf"]), ("All files", ["*"])])
+    except VpnError as e:
+        raise VpnError(f"{e} (paste the text instead)")
+    if path is None:
+        return VPN_EXIT["cancelled"]
+    print(path)
     return 0
 
 
@@ -3657,7 +4002,6 @@ def cmd_restore(args):
 # ---------------------------------------------------------------- quick menu (fuzzel)
 
 MENU_DURATIONS = ("5m", "10m", "15m", "30m", "off")
-WALLPAPER_EXTS = (".png", ".jpg", ".jpeg")
 
 
 def notify(title, body, critical=False):
@@ -4167,6 +4511,20 @@ def main():
     ke.add_argument("--json", action="store_true", help="one JSON object: count, groups of binds, layout_map for the search")
     common(ke)
     ke.set_defaults(fn=cmd_keys)
+    wl = sub.add_parser("wallpaper", help="wallpaper helpers: pick file|folder (desktop file chooser; exit 5 cancelled, 3 unavailable), "
+                                         "monitor set MATCH [--path P --fit F --interval I] | monitor clear MATCH (per-monitor wallpaper)")
+    wls = wl.add_subparsers(dest="action", required=True)
+    wp_ = wls.add_parser("pick")
+    wp_.add_argument("kind", choices=["file", "folder"])
+    wm = wls.add_parser("monitor")
+    wm.add_argument("op", choices=["set", "clear"])
+    wm.add_argument("match", help='"desc:<description>" or an output name like DP-1')
+    wm.add_argument("--path")
+    wm.add_argument("--fit")
+    wm.add_argument("--interval")
+    wm.add_argument("--dry-run", action="store_true", help="show the diffs, write nothing")
+    common(wm, True)
+    wl.set_defaults(fn=cmd_wallpaper)
     s = sub.add_parser("set", help="change settings in settings.toml (comments kept), then apply")
     s.add_argument("--dry-run", action="store_true", help="show the diffs, write nothing")
     s.add_argument("pairs", nargs="+", metavar="KEY VALUE", help="e.g. idle.lock_after 10m  |  keyboard.layouts us,ir")

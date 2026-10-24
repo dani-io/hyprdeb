@@ -73,6 +73,17 @@ puts do-not-disturb back to what `settings.toml` says at login.
 The wallpaper block is generated from `[wallpaper]`; the default image is a plain gradient made by `assets/make-wallpaper.py`
 (standard library only, reproducible), created once if `~/.config/hypr/wallpaper.png` does not exist.
 
+- hyprpaper 0.8.4 loads png, jpg, jpeg, webp, jxl and bmp; gif and tiff fail. In a slideshow folder it tries every image-like file,
+  so `hyprdeb apply` warns about the ones it cannot load. Without `order` it uses the raw directory order (not sorted), so hyprdeb always
+  writes `order = random`. Subfolders are not read.
+- A "center at original size" mode does not exist in hyprpaper and is not emulated: `contain` is the closest.
+- Never use the runtime IPC (`hyprctl hyprpaper wallpaper ...`): in 0.8.4 the call hangs and hyprpaper dies. Every change goes through
+  `hyprdeb apply`, which restarts hyprpaper.
+- The lock screen background comes from the generated `~/.config/hypr/hyprdeb-lock.conf`, which `hyprlock.conf` sources. hyprlock
+  loads the same image formats; an image it cannot load leaves a plain colour (no crash). hyprdeb still gives it only the formats listed
+  above, and uses the shipped image when the chosen one is not usable. A missing sourced file is a config error on the lock screen:
+  `hyprdeb-lock` and the installer re-create it with the default image.
+
 ## Packages
 
 - Available in Debian 13 or its backports: Hyprland and the Hypr* tools, hyprland-guiutils, quickshell, hyprlauncher, hyprsunset,

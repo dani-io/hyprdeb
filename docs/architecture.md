@@ -25,7 +25,8 @@ database or a ledger. Every installer stage looks at the real state of the machi
         v
 ~/.config/hypr/hyprdeb-settings.lua   monitors, keyboard, mouse (hl.config blocks)
 ~/.config/hypr/hyprdeb-idle.conf      hypridle timeouts
-~/.config/hypr/hyprdeb-paper.conf     hyprpaper wallpaper
+~/.config/hypr/hyprdeb-paper.conf     hyprpaper wallpaper blocks (all monitors, and one per monitor override)
+~/.config/hypr/hyprdeb-lock.conf      hyprlock background blocks, sourced by hyprlock.conf
 ~/.config/mako/hyprdeb-settings       notification timeout, opacity, font
 ~/.config/fontconfig/conf.d/60-hyprdeb-persian.conf   one Arabic-script family for the whole desktop
 ```

@@ -9,7 +9,8 @@ file (comments kept) and applies it.
 |---|---|---|
 | `[[monitors]]` (one block per output) | `match` (`desc:<description>` or an output name such as `DP-1`), `mode`, `position`, `scale`, `disabled` | Hyprland reload |
 | `[idle]` | `lock_after`, `screen_off_after` (`"off"` or `90s`, `10m`, `1h`; at least 30 s) | restart of hypridle |
-| `[wallpaper]` | `path`, `fit` (`cover`, `contain`, `tile`, `fill`) | restart of hyprpaper |
+| `[wallpaper]` | `path` (an image, or a folder for a slideshow), `fit` (`cover`, `contain`, `tile`, `fill`), `interval` (slideshow, `10s` to `24h`, default `30m`), `order` (`random`), `lock` (`same`, `default` or an image; default `same`), `lock_blur` (0 to 4, default 2) | restart of hyprpaper (the lock screen reads its file at each lock) |
+| `[[wallpaper.monitor]]` (one block per monitor) | `match` (as in `[[monitors]]`), `path`, `fit`, `interval`; whatever is left out comes from `[wallpaper]` | restart of hyprpaper |
 | `[keyboard]` | `layouts`, `variants`, `toggle` (`caps`, `alt_shift`, `win_space`), `repeat_rate`, `repeat_delay`, `numlock` | Hyprland reload |
 | `[mouse]` | `speed`, `acceleration`, `natural_scroll`, `scroll_speed`, `left_handed`, `focus_follows` | Hyprland reload |
 | `[notifications]` | `timeout`, `opacity`, `font`, `dnd` | mako reload |
@@ -25,6 +26,15 @@ for it (mouse and keyboard repeat settings, for example).
 
 Layouts must be names from the xkb list (`/usr/share/X11/xkb/rules/evdev.lst`) and the first one must be Latin. With a single
 layout the toggle key is ignored and Caps Lock keeps working as Caps Lock.
+
+Wallpaper: formats are png, jpg, jpeg, webp, jxl and bmp, in any letter case (hyprpaper cannot load gif or tiff; a slideshow folder
+that contains one gets a warning). A folder is a slideshow of the images directly inside it, in random order; subfolders are not read.
+The Wallpaper page of the settings window sets all of this: a monitor selector (the connected monitors by description, plus saved
+overrides of monitors that are not connected), a thumbnail grid, the fit (Fill screen = `cover`, Fit, centered = `contain`, Tile,
+Stretch = `fill`), the slideshow with its interval, and "Choose file..." / "Choose folder..." (the desktop file chooser). The lock
+screen follows the wallpaper by default (blur 2); a slideshow uses its first image by name so the lock screen is the same at every lock.
+Per-monitor overrides can be edited by hand or with `hyprdeb wallpaper monitor set MATCH [--path P] [--fit F] [--interval I]` and
+`hyprdeb wallpaper monitor clear MATCH`.
 
 Commands: `hyprdeb show` (effective values), `hyprdeb get KEY`, `hyprdeb set KEY VALUE...`, `hyprdeb check`, `hyprdeb apply`,
 `hyprdeb gui [--page NAME]`, `hyprdeb keys`, `hyprdeb net ...`, `hyprdeb vpn ...`, `hyprdeb nas ...`, `hyprdeb print ...`,

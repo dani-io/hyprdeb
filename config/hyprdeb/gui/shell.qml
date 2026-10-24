@@ -249,6 +249,67 @@ FloatingWindow {
         netCtl.running = true
     }
     function setStatus(text, isError) { status = text; statusError = isError }
+    // Wallpaper: the page edits one target at a time ("All monitors", or one monitor with its own wallpaper). All monitors goes through
+    // `hyprdeb set wallpaper.KEY VALUE`, a single monitor through `hyprdeb wallpaper monitor set|clear MATCH`; "Choose file / folder" is
+    // `hyprdeb wallpaper pick file|folder` (the desktop file chooser). The window holds no wallpaper logic.
+    property string wallMatch: ""              // the selected target's `match` ("" = all monitors)
+    readonly property var wallFits: [["cover", "Fill screen"], ["contain", "Fit, centered"], ["tile", "Tile"], ["fill", "Stretch"]]
+    function wallTargets() { return cfg && cfg.ok && cfg.wallpaper.targets ? cfg.wallpaper.targets : [] }
+    function wallT() {
+        var ts = wallTargets()
+        for (var i = 0; i < ts.length; i++) if (ts[i].match === wallMatch) return ts[i]
+        return ts.length ? ts[0] : null
+    }
+    function wallIndex() {
+        var ts = wallTargets()
+        for (var i = 0; i < ts.length; i++) if (ts[i].match === wallMatch) return i
+        return 0
+    }
+    function baseName(p) { var i = p.lastIndexOf("/"); return i < 0 ? p : p.substring(i + 1) }
+    function wallApply(f, what) {
+        var t = wallT()
+        if (busy || !t) return
+        busy = true
+        var cmd
+        if (t.match === "") {
+            cmd = [bin, "set"]
+            for (var k in f) cmd.push("wallpaper." + k, f[k])
+        } else {
+            cmd = [bin, "wallpaper", "monitor", "set", t.match]
+            for (var k2 in f) cmd.push("--" + k2, f[k2])
+        }
+        setter.key = "wallpaper"
+        setter.value = what
+        setter.command = cmd
+        setter.running = true
+    }
+    function wallSame() {            // back to the all-monitors wallpaper: forget this monitor's own settings
+        var t = wallT()
+        if (busy || !t || t.match === "") return
+        busy = true
+        setter.key = "wallpaper"
+        setter.value = "same as all monitors"
+        setter.command = [bin, "wallpaper", "monitor", "clear", t.match]
+        setter.running = true
+    }
+    function wallSlideshow(on) {
+        var t = wallT()
+        if (!t) return
+        var c = cfg.wallpaper.candidates
+        if (on) {
+            if (cfg.wallpaper.folder && c.length > 1) wallApply({ path: cfg.wallpaper.folder }, "slideshow of " + cfg.wallpaper.folder)
+            else setStatus("No folder with images found: use Choose folder.", true)
+        } else {
+            var f = c.length > 1 ? c[1] : c[0]
+            wallApply({ path: f.path }, f.label)
+        }
+    }
+    function wallPickStart(kind) {
+        if (busy || wallPick.running) return
+        wallPick.kind = kind
+        wallPick.command = [bin, "wallpaper", "pick", kind]
+        wallPick.running = true
+    }
     function setValue(key, value) {
         if (busy) return
         busy = true
@@ -270,6 +331,18 @@ FloatingWindow {
             } catch (e) {
                 win.setStatus("could not read the output of: " + win.bin + " show --json", true)
             }
+        }
+    }
+
+    Process {
+        id: wallPick
+        property string kind: "file"
+        stdout: StdioCollector { id: wallPickOut }
+        stderr: StdioCollector { id: wallPickErr }
+        onExited: (code, status) => {
+            if (code === 0) { var p = wallPickOut.text.trim(); win.wallApply({ path: p }, win.baseName(p)) }
+            else if (code === 5) win.setStatus("", false)
+            else win.setStatus(wallPickErr.text.trim().replace(/^hyprdeb: error: /, "") || "The file chooser failed.", true)
         }
     }
 
@@ -572,6 +645,38 @@ FloatingWindow {
                 contentItem: Text { text: modelData; color: "white"; font.pixelSize: 15 }
                 background: Rectangle { color: highlighted ? "#3d4870" : win.panel }
                 highlighted: box.highlightedIndex === index
+            }
+            popup.background: Rectangle { color: win.panel; radius: 4; border.color: "#3d4870" }
+        }
+    }
+
+    // A drop-down whose entries are shown text; `picked(index)` tells which one was chosen (Choice sends the text itself as the value).
+    component PickRow: RowLayout {
+        id: prow
+        property string label: ""
+        property var model: []
+        property int index: 0
+        property int boxWidth: 260
+        signal picked(int index)
+        spacing: 12
+        Text { text: prow.label; color: win.fg; font.pixelSize: 15; Layout.preferredWidth: 150 }
+        ComboBox {
+            id: pbox
+            Layout.preferredWidth: prow.boxWidth
+            model: prow.model
+            enabled: !win.busy
+            function sync() { currentIndex = prow.index }
+            onModelChanged: sync()
+            Connections { target: prow; function onIndexChanged() { pbox.sync() } }
+            Connections { target: win; function onCfgChanged() { Qt.callLater(pbox.sync) } }
+            onActivated: i => prow.picked(i)
+            contentItem: Text { text: pbox.displayText; color: "white"; leftPadding: 8; verticalAlignment: Text.AlignVCenter; font.pixelSize: 15; elide: Text.ElideRight }
+            background: Rectangle { color: win.panel; radius: 4 }
+            delegate: ItemDelegate {
+                width: pbox.width
+                contentItem: Text { text: modelData; color: "white"; font.pixelSize: 15; elide: Text.ElideRight }
+                background: Rectangle { color: highlighted ? "#3d4870" : win.panel }
+                highlighted: pbox.highlightedIndex === index
             }
             popup.background: Rectangle { color: win.panel; radius: 4; border.color: "#3d4870" }
         }
@@ -1316,48 +1421,133 @@ FloatingWindow {
             Page {
                 // ---- page: wallpaper ----
                 Heading { text: "Wallpaper"; icon: win.icon("wallpaper") }
-                ListView {
+                PickRow {
+                    visible: win.wallTargets().length > 1
+                    label: "Monitor"
+                    boxWidth: 420
+                    model: win.wallTargets().map(t => t.label)
+                    index: win.wallIndex()
+                    onPicked: i => win.wallMatch = win.wallTargets()[i].match
+                }
+                RowLayout {
+                    visible: win.wallT() !== null && win.wallT().match !== ""
+                    spacing: 12
+                    Text { text: "Same as all monitors"; color: win.fg; font.pixelSize: 15; Layout.preferredWidth: 150 }
+                    Switch {
+                        id: sameSw
+                        enabled: !win.busy
+                        function sync() { checked = win.wallT() !== null && !win.wallT().own }
+                        Component.onCompleted: sync()
+                        Connections { target: win; function onCfgChanged() { Qt.callLater(sameSw.sync) } }
+                        Connections { target: win; function onWallMatchChanged() { Qt.callLater(sameSw.sync) } }
+                        onToggled: {
+                            var t = win.wallT()
+                            if (checked) win.wallSame()
+                            else win.wallApply({ path: t.path, fit: t.fit }, "own wallpaper for this monitor")
+                        }
+                    }
+                }
+                Text {
+                    visible: win.wallT() !== null && win.wallT().match !== "" && !win.wallT().connected
+                    text: "This monitor is not connected. Its wallpaper is kept and used when it is back."
+                    color: win.dim; font.pixelSize: 13
+                }
+                Text {
+                    visible: win.wallT() !== null && win.wallT().kind === "dir"
+                    text: win.wallT() ? "Slideshow of the images in " + win.wallT().path + " (random order)" : ""
+                    color: win.dim; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true
+                }
+                GridView {
                     id: wall
+                    visible: win.wallT() !== null && win.wallT().kind !== "dir"
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(contentHeight, 190)   // sized to its content, at most 190
+                    Layout.preferredHeight: Math.min(contentHeight, 270)   // sized to its content, at most 270
+                    cellWidth: 150; cellHeight: 104
                     clip: true
-                    spacing: 4
                     model: win.cfg && win.cfg.ok ? win.cfg.wallpaper.candidates : []
                     ScrollBar.vertical: ScrollBar {}
-                    delegate: Rectangle {
-                        width: wall.width - 12
-                        height: 48
-                        radius: 4
-                        color: modelData.current ? "#3d4870" : (hover.hovered ? "#323b5c" : win.panel)
-                        HoverHandler { id: hover }
-                        TapHandler { enabled: !win.busy; onTapped: win.setValue("wallpaper.path", modelData.path) }
-                        Row {
-                            anchors.fill: parent
-                            anchors.margins: 6
-                            spacing: 10
-                            Image {
-                                width: 64; height: 36
-                                source: "file://" + modelData.file
-                                sourceSize.width: 128
-                                fillMode: Image.PreserveAspectCrop
-                                asynchronous: true
+                    delegate: Item {
+                        width: wall.cellWidth; height: wall.cellHeight
+                        readonly property bool isCurrent: win.wallT() !== null && win.wallT().file === modelData.file
+                        Rectangle {
+                            anchors.fill: parent; anchors.margins: 3
+                            radius: 4
+                            color: parent.isCurrent ? "#3d4870" : (hover.hovered ? "#323b5c" : win.panel)
+                            HoverHandler { id: hover }
+                            TapHandler { enabled: !win.busy; onTapped: win.wallApply({ path: modelData.path }, modelData.label) }
+                            Rectangle {
+                                x: 5; y: 5; width: 134; height: 70; color: "#232a3f"
+                                Text { anchors.centerIn: parent; visible: thumb.status !== Image.Ready; text: win.baseName(modelData.file).split(".").pop(); color: win.dim; font.pixelSize: 13 }
+                                Image {
+                                    id: thumb
+                                    anchors.fill: parent
+                                    source: "file://" + modelData.file
+                                    sourceSize.width: 256         // decoded at thumbnail size, not full size
+                                    fillMode: Image.PreserveAspectCrop
+                                    asynchronous: true
+                                }
                             }
                             Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: (modelData.current ? "● " : "") + modelData.label
-                                color: win.fg
-                                font.pixelSize: 15
-                                font.bold: modelData.current
-                                elide: Text.ElideRight
-                                width: parent.width - 90
+                                x: 6; y: 78; width: 132
+                                text: (parent.parent.isCurrent ? "\u25cf " : "") + modelData.label
+                                color: win.fg; font.pixelSize: 12; elide: Text.ElideRight
                             }
                         }
                     }
                 }
                 Text {
-                    visible: win.cfg && win.cfg.ok && win.cfg.wallpaper.candidates.length <= 1
-                    text: "No images found in ~/Pictures/Wallpapers or ~/Pictures."
+                    visible: win.cfg && win.cfg.ok && win.cfg.wallpaper.candidates.length <= 1 && win.wallT() !== null && win.wallT().kind !== "dir"
+                    text: "No images found in ~/Pictures/Wallpapers or ~/Pictures. Use Choose file."
                     color: win.dim; font.pixelSize: 13
+                }
+                RowLayout {
+                    spacing: 8
+                    ActionButton { label: "Choose file\u2026"; enabled: !win.busy && !wallPick.running; onClicked: win.wallPickStart("file") }
+                    ActionButton { label: "Choose folder\u2026 (slideshow)"; enabled: !win.busy && !wallPick.running; onClicked: win.wallPickStart("folder") }
+                }
+                PickRow {
+                    label: "Fit"
+                    model: win.wallFits.map(f => f[1])
+                    index: { var t = win.wallT(); if (!t) return 0; for (var i = 0; i < win.wallFits.length; i++) if (win.wallFits[i][0] === t.fit) return i; return 0 }
+                    onPicked: i => win.wallApply({ fit: win.wallFits[i][0] }, win.wallFits[i][1])
+                }
+                RowLayout {
+                    spacing: 12
+                    Text { text: "Slideshow"; color: win.fg; font.pixelSize: 15; Layout.preferredWidth: 150 }
+                    Switch {
+                        id: slideSw
+                        enabled: !win.busy
+                        function sync() { checked = win.wallT() !== null && win.wallT().kind === "dir" }
+                        Component.onCompleted: sync()
+                        Connections { target: win; function onCfgChanged() { Qt.callLater(slideSw.sync) } }
+                        Connections { target: win; function onWallMatchChanged() { Qt.callLater(slideSw.sync) } }
+                        onToggled: win.wallSlideshow(checked)
+                    }
+                }
+                PickRow {
+                    visible: win.wallT() !== null && win.wallT().kind === "dir"
+                    label: "Change every"
+                    boxWidth: 140
+                    model: { var t = win.wallT(), p = win.cfg && win.cfg.ok ? win.cfg.wallpaper.interval_presets : []; return t && p.indexOf(t.interval) < 0 ? p.concat([t.interval]) : p }
+                    index: { var t = win.wallT(); return t ? Math.max(0, model.indexOf(t.interval)) : 0 }
+                    onPicked: i => win.wallApply({ interval: model[i] }, "change every " + model[i])
+                }
+
+                Heading { text: "Lock screen"; icon: win.icon("lock") }
+                PickRow {
+                    label: "Background"
+                    boxWidth: 260
+                    model: { var l = win.cfg && win.cfg.ok ? win.cfg.settings["wallpaper.lock"] : "same"; return l === "same" || l === "default" ? ["Same as the wallpaper", "Default image"] : ["Same as the wallpaper", "Default image", "Chosen in settings.toml"] }
+                    index: { var l = win.cfg && win.cfg.ok ? win.cfg.settings["wallpaper.lock"] : "same"; return l === "same" ? 0 : l === "default" ? 1 : 2 }
+                    onPicked: i => { if (i < 2) win.setValue("wallpaper.lock", i === 0 ? "same" : "default") }
+                }
+                SliderRow {
+                    label: "Blur"; key: "wallpaper.lock_blur"; from: 0; to: win.cfg && win.cfg.ok ? win.cfg.wallpaper.lock_blur_max : 4; step: 1; decimals: 0
+                    current: win.cfg && win.cfg.ok ? win.cfg.settings["wallpaper.lock_blur"] : 2
+                }
+                Text {
+                    text: "Formats: " + (win.cfg && win.cfg.ok ? win.cfg.wallpaper.extensions.join(" ") : "")
+                    color: win.dim; font.pixelSize: 12
                 }
 
             }

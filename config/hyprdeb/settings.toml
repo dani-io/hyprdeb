@@ -20,11 +20,27 @@
 # lock_after       = "10m"    # "off" or a duration: "90s", "10m", "1h" (minimum 30s)
 # screen_off_after = "15m"    # "off" or a duration; must be longer than lock_after when both are on
 #
-# Wallpaper. Absent = ~/.config/hypr/wallpaper.png, cover. Applied by restarting hyprpaper.
+# Wallpaper and lock screen. Absent = ~/.config/hypr/wallpaper.png, cover, on every monitor. Applied by restarting hyprpaper.
+# Formats: png, jpg, jpeg, webp, jxl, bmp (any letter case). hyprpaper cannot load gif or tiff.
 #
 # [wallpaper]
-# path = "~/.config/hypr/wallpaper.png"   # an image file (absolute or starting with ~); must exist and be readable
-# fit  = "cover"                          # cover, contain, tile or fill
+# path = "~/.config/hypr/wallpaper.png"   # an image file, or a FOLDER = slideshow of the images directly inside it (random order,
+#                                         # subfolders are not read); absolute or starting with ~; must exist and be readable
+# fit  = "cover"                          # cover (fill the screen), contain (whole image, centered), tile or fill (stretch)
+# interval = "30m"                        # slideshow only: time between two images, "10s" to "24h" (units s, m, h)
+# order    = "random"                     # slideshow order; random is the only one hyprpaper supports
+# lock      = "same"                      # lock screen: "same" (as the wallpaper; a slideshow uses its first image by name),
+#                                         # "default" (the shipped image) or an image file
+# lock_blur = 2                           # lock screen blur, 0 to 4
+#
+# A monitor can have its own wallpaper: one block per monitor, any of path, fit, interval (the rest comes from above).
+# A block for a monitor that is not connected is kept and only gives a warning.
+#
+# [[wallpaper.monitor]]
+# match = "desc:Vendor Model SERIAL"      # "desc:<description>" (see `hyprctl monitors`; the start of it is enough) or an output name like DP-1
+# path  = "~/Pictures/Wallpapers"
+# fit   = "contain"
+# interval = "5m"
 #
 # Keyboard. Absent = the US layout only. More layouts are listed here; with two or more, `toggle` is the key that switches them.
 # Names are checked against the xkb list. The first layout must be Latin (the lock screen switches to layout 0 before locking).

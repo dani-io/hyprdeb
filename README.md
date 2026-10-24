@@ -21,9 +21,9 @@ file with a small command-line tool and a settings window, and an idempotent ins
 |---|---|
 | Compositor | Hyprland 0.55 from `trixie-backports` (Lua configuration), hyprlock, hypridle, hyprpaper, hyprlauncher |
 | Desktop | waybar, mako notifications, a quick menu (`SUPER+Escape`), a searchable shortcuts window (`SUPER+/`), clipboard history, screenshots with swappy |
-| Settings window | Quickshell window with a sidebar: Network, VPN, NAS, Printers, Monitors, Wallpaper, Idle, Keyboard, Mouse, Notifications, Fonts |
+| Settings window | Quickshell window with a sidebar: Network, VPN, NAS, Printers, Monitors, Wallpaper (per-monitor, slideshow, lock screen), Idle, Keyboard, Mouse, Notifications, Fonts |
 | Apps | kitty, Thunar, Chrome (optional), Firefox ESR fallback, Kate, OBS, mpv; Flatpak apps are opt-in |
-| Opt-in | NVIDIA driver, VS Code, Flatpak, OBS virtual camera, greetd login screen, NetworkManager, NAS shares, printing, Claude Desktop prerequisites |
+| Opt-in | NVIDIA driver, VS Code, Flatpak, OBS virtual camera, greetd login screen, NetworkManager, NAS shares, printing, local virtual machines (libvirt + virt-manager), Claude Desktop prerequisites |
 
 ## Screenshots
 
@@ -53,7 +53,7 @@ git clone https://github.com/dani-io/hyprdeb.git
 cd hyprdeb
 ./install.sh --dry-run          # read what it will do
 ./install.sh                    # system packages and user config (asks for sudo)
-# add what you need:  --nvidia  --flatpak  --vscode  --virtualcam  --timezone Europe/Berlin
+# add what you need:  --nvidia  --flatpak  --vscode  --virtualcam  --virt  --timezone Europe/Berlin
 ```
 
 Log in on a text console and start the session with `start-hyprland`, or enable the optional login screen with
@@ -70,6 +70,7 @@ configuration without sudo. Run any of them again at any time.
 | `--greeter` | greetd with the tuigreet text login screen on VT 7, active from the next boot | [recovery](docs/recovery.md#login-screen-greetd) |
 | `--networkmanager` | moves the wired connection from ifupdown/dhcpcd to NetworkManager, with the same DHCP client id and an automatic rollback timer | [recovery](docs/recovery.md#networkmanager) |
 | `--nas` | installs the root helper behind the NAS page and sets up the shares in `settings.toml` | [security](SECURITY.md), [architecture](docs/architecture.md#root-helpers) |
+| `--virt` | libvirt + virt-manager with the default NAT network (no LAN bridge); guests are shut down, not suspended, when the host shuts down | [virt](docs/virt.md) |
 | `--printing` | CUPS (no avahi, no cups-browsed) and one printer queue from `[printing]` | [printing](docs/printing.md) |
 | `--nvidia` | the proprietary driver and the options Wayland needs across suspend | [gotchas](docs/gotchas.md#nvidia) |
 | `--cowork` | QEMU, the `kvm` group and `vhost_vsock` for Claude Desktop's Cowork VM (Claude Desktop itself is not installed) | [gotchas](docs/gotchas.md#claude-desktop-cowork) |
@@ -124,7 +125,7 @@ config/hypr/          Hyprland Lua blocks and hyprlock/hypridle/hyprpaper config
 config/hyprdeb/       settings template, generated-file defaults, the Quickshell windows (gui/)
 config/systemd/, polkit/, greetd/, modprobe/, sysctl/   root-owned files for the opt-in stages
 assets/               generated default wallpaper, the Tabler icon font
-docs/                 architecture, gotchas, recovery, printing, settings reference
+docs/                 architecture, gotchas, recovery, printing, virtual machines, settings reference
 ```
 
 ## Known limits

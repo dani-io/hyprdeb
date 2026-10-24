@@ -1,0 +1,14 @@
+# Local virtual machines (install.sh --virt), installed with --no-install-recommends.
+# libvirt's system daemon (qemu:///system), the default NAT network and the GUI.
+libvirt-daemon-system
+libvirt-clients
+virt-manager
+dnsmasq-base                 # DHCP and DNS for the default NAT network (virbr0)
+swtpm                        # emulated TPM (Windows 11 guests)
+swtpm-tools                  # swtpm_setup, which libvirt runs to create the TPM state
+gir1.2-spiceclientgtk-3.0    # virt-manager's SPICE console (only a Recommends of virt-manager)
+# QEMU itself (the same packages as --cowork, so --virt works on its own)
+qemu-system-x86
+qemu-utils
+ovmf                         # UEFI firmware
+qemu-system-modules-spice    # SPICE display for guests
